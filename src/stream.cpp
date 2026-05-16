@@ -271,6 +271,8 @@ namespace stream {
     RTP_PACKET rtp;
   };
 
+  constexpr std::uint8_t MIC_PACKET_TYPE_OPUS = 0x61;  // 'a'
+
   // 扩展的RTP包结构，支持16位包类型
   struct rtp_packet_ext_t {
     std::uint8_t header;

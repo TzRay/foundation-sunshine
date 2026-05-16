@@ -9,8 +9,8 @@ on:
       - synchronize
       - reopened
   push:
-    branches:
-      - master
+    tags:
+      - 'v*'
   release:
     types: [published]
   workflow_dispatch:

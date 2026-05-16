@@ -1240,12 +1240,12 @@ namespace rtsp_stream {
           }
         }
         else if (config.audio.codec == audio::CODEC_PCM_S16) {
-          // Force 5 ms framing: 48k * 5ms = 240 samples, 5.1ch * 16bit = 2880 B
-          // (fits the 4 KB receiver buffer).
+          // Force 5 ms framing: 48k * 5ms = 240 samples. 7.1.4 PCM16 is
+          // 5760 B/frame and requires a client-side 8 KB receive buffer.
           config.audio.packetDuration = 5;
-          if (config.audio.channels > 6) {
+          if (config.audio.channels > 12) {
             BOOST_LOG(warning) << "PCM_S16 passthrough rejected: "sv
-                               << config.audio.channels << " channels exceeds 5.1 limit"sv;
+                               << config.audio.channels << " channels exceeds 7.1.4 limit"sv;
             respond(sock, session, &option, 415, "UNSUPPORTED MEDIA TYPE", req->sequenceNumber, {});
             return;
           }

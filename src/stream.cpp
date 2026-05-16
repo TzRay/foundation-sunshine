@@ -294,7 +294,7 @@ namespace stream {
   //
   //   AC3 @640 kbps:  640e3 / 8 * (1536 / 48000)         = 2560 B  (32 ms)
   //   E-AC3 @384k:    384e3 / 8 * (1536 / 48000)         = 1536 B  (32 ms)
-  //   PCM_S16 5ms 8c: 5 * 48 * 8 * sizeof(int16_t)        = 3840 B  (worst PCM)
+  //   PCM_S16 5ms 12c: 5 * 48 * 12 * sizeof(int16_t)      = 5760 B  (7.1.4 PCM)
   //   Opus (any cfg): bounded well under 1500 B in practice
   //
   // The compile-time max() ensures adding a new codec only requires bumping
@@ -309,7 +309,7 @@ namespace stream {
   namespace audio_payload {
     constexpr std::size_t kAc3MaxFrameBytes    = 2560;  // 640 kbps * 32 ms
     constexpr std::size_t kEac3MaxFrameBytes   = 1536;  // 384 kbps * 32 ms
-    constexpr std::size_t kPcmS16MaxFrameBytes = 5 * 48 * 8 * sizeof(int16_t);  // 5 ms * 48 kHz * 8 ch
+    constexpr std::size_t kPcmS16MaxFrameBytes = 5 * 48 * 12 * sizeof(int16_t);  // 5 ms * 48 kHz * 12 ch
     constexpr std::size_t kOpusMaxFrameBytes   = 1500;  // generous upper bound
     constexpr std::size_t kHeadroomBytes       = 64;    // future-proofing margin
   }  // namespace audio_payload

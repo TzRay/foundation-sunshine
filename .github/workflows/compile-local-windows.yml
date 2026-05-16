@@ -1,0 +1,103 @@
+name: Compile Local Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  compile_windows:
+    name: Windows compile-only
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          update: true
+          install: >-
+            git
+            wget
+            curl
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-graphviz
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-autotools
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build Web UI
+        shell: pwsh
+        run: |
+          npm install
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $env:SUNSHINE_SOURCE_ASSETS_DIR = "${{ github.workspace }}\src_assets"
+          $env:SUNSHINE_ASSETS_DIR = "${{ github.workspace }}\build"
+          npm run build
+
+      - name: Configure
+        shell: msys2 {0}
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BUILD_VERSION: local-${{ github.run_number }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          cmake \
+            -B build \
+            -G Ninja \
+            -S . \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_WEB_UI=OFF \
+            -DFETCH_DRIVER_DEPS=OFF \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_PUBLISHER_NAME='${{ github.repository_owner }}' \
+            -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/${{ github.repository }}' \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/${{ github.repository }}/issues'
+
+      - name: Build
+        shell: msys2 {0}
+        run: ninja -C build
+
+      - name: Stage replacement files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path local-replacement\tools | Out-Null
+          Copy-Item build\sunshine.exe local-replacement\sunshine.exe -Force
+          Copy-Item build\tools\sunshinesvc.exe local-replacement\tools\sunshinesvc.exe -Force
+          if (Test-Path build\assets\web) {
+            New-Item -ItemType Directory -Force -Path local-replacement\assets | Out-Null
+            Copy-Item build\assets\web local-replacement\assets\web -Recurse -Force
+          }
+
+      - name: Upload replacement artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunshine-local-windows-${{ github.run_number }}
+          path: local-replacement
+          if-no-files-found: error

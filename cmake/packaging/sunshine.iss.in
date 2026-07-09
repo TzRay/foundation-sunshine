@@ -62,6 +62,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; 重启管理器
 CloseApplications=yes
 RestartApplications=yes
+; Driver/helper installers may return a reboot-required exit code. Do not show
+; Inno's final reboot prompt; users can reboot later if a driver needs it.
+RestartIfNeededByRun=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -160,12 +163,16 @@ Name: "assets"; Description: "{cm:ComponentAssets}"; Types: recommended full com
 Name: "vdd"; Description: "{cm:ComponentVDD} — {cm:ComponentVDDDesc}"; Types: recommended full; ExtraDiskSpaceRequired: 2097152
 Name: "firewall"; Description: "{cm:ComponentFirewall} — {cm:ComponentFirewallDesc}"; Types: recommended full compact
 Name: "autostart"; Description: "{cm:ComponentAutostart} — {cm:ComponentAutostartDesc}"; Types: recommended full
-Name: "gamepad"; Description: "{cm:ComponentGamepad} — {cm:ComponentGamepadDesc}"; Types: full
-Name: "vmouse"; Description: "{cm:ComponentVmouse} — {cm:ComponentVmouseDesc}"; Types: full
-Name: "tools"; Description: "{cm:ComponentTools} — {cm:ComponentToolsDesc}"; Types: full
+Name: "gamepad"; Description: "{cm:ComponentGamepad} — {cm:ComponentGamepadDesc}"; Types: recommended full
+Name: "vmouse"; Description: "{cm:ComponentVmouse} — {cm:ComponentVmouseDesc}"; Types: recommended full
+Name: "tools"; Description: "{cm:ComponentTools} — {cm:ComponentToolsDesc}"; Types: recommended full
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+
+[InstallDelete]
+; Remove old hashed Web UI bundles before installing the freshly built frontend.
+Type: filesandordirs; Name: "{app}\assets\web"
 
 [Files]
 ; Main application
@@ -228,7 +235,7 @@ Source: "{#MySourceDir}\scripts\uninstall-gamepad.bat"; DestDir: "{app}\scripts"
 ; Virtual Mouse Driver scripts & files
 Source: "{#MySourceDir}\scripts\vmouse\install-vmouse.bat"; DestDir: "{app}\scripts\vmouse"; Flags: ignoreversion
 Source: "{#MySourceDir}\scripts\vmouse\uninstall-vmouse.bat"; DestDir: "{app}\scripts\vmouse"; Flags: ignoreversion
-Source: "{#MySourceDir}\scripts\vmouse\driver\*"; DestDir: "{app}\scripts\vmouse\driver"; Flags: ignoreversion recursesubdirs
+Source: "{#MySourceDir}\scripts\vmouse\driver\*"; DestDir: "{app}\scripts\vmouse\driver"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 
 ; Virtual audio sink (microphone / VB-Cable) scripts
 ; Always shipped — there is no install-time component for this; the user can
@@ -259,8 +266,9 @@ Name: "{app}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--sh
 Root: HKLM64; Subkey: "SOFTWARE\AlkaidLab\Sunshine"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"; Flags: uninsdeletevalue
 
 [Run]
-; Post-install actions (shown on progress page)
-Filename: "{cmd}"; Parameters: "/c icacls ""{app}"" /reset /T /C /Q >nul 2>&1"; StatusMsg: "{cm:StatusResetPermissions}"; Flags: runhidden
+; Post-install: drop explicit ACEs (inherit from parent) + clear READONLY
+; attribute on files & dirs. The latter is what fixes the rare "Sunshine
+Filename: "{cmd}"; Parameters: "/c icacls ""{app}"" /reset /T /C > ""{tmp}\sunshine-icacls-reset.log"" 2>&1 & attrib -R ""{app}\*.*"" /S /D > ""{tmp}\sunshine-attrib-clear.log"" 2>&1"; StatusMsg: "{cm:StatusResetPermissions}"; Flags: runhidden waituntilterminated
 Filename: "{app}\scripts\update-path.bat"; Parameters: "add"; StatusMsg: "{cm:StatusUpdatePath}"; Flags: runhidden waituntilterminated
 Filename: "{app}\scripts\migrate-config.bat"; StatusMsg: "{cm:StatusMigrateConfig}"; Flags: runhidden waituntilterminated
 Filename: "{app}\scripts\add-firewall-rule.bat"; StatusMsg: "{cm:StatusFirewall}"; Flags: runhidden waituntilterminated; Components: firewall
@@ -273,8 +281,15 @@ Filename: "{app}\scripts\autostart-service.bat"; StatusMsg: "{cm:StatusAutostart
 ; Finish page actions - user selectable
 ; Use explorer.exe to launch GUI so it always runs as the non-elevated current user,
 ; even though the installer itself is running with admin privileges.
+; `runascurrentuser` is required: without it Inno 6 routes postinstall items
+; through its SpawnServer to demote to the originating user. That helper
+; expects to talk to Inno's own rundll32-based child and fails with
+; "CallSpawnServer: Unexpected response: $0" the moment explorer.exe forwards
+; the request to the existing shell instance and exits. We don't need Inno's
+; demotion here anyway — the explorer.exe trick performs the de-elevation at
+; the Windows shell level on its own.
 Filename: "https://docs.qq.com/aio/DSGdQc3htbFJjSFdO?p=DXpTjzl2kZwBjN7jlRMkRJ"; Description: "{cm:FinishOpenDocs}"; Flags: postinstall shellexec runascurrentuser unchecked nowait skipifsilent
-Filename: "{win}\explorer.exe"; Parameters: """{app}\assets\gui\{#MyAppGUIExeName}"""; Description: "{cm:FinishLaunchGUI}"; Flags: postinstall nowait skipifsilent
+Filename: "{win}\explorer.exe"; Parameters: """{app}\assets\gui\{#MyAppGUIExeName}"""; Description: "{cm:FinishLaunchGUI}"; Flags: postinstall nowait skipifsilent runascurrentuser
 
 [UninstallRun]
 ; Stop running processes first. We force-kill the service binary
@@ -584,37 +599,80 @@ end;
 
 procedure VerifyServiceInstalled();
 var
-  ResultCode: Integer;
-  TmpFile, ExpectedPath, Line, Lower: String;
+  ExpectedPath, ImagePath, Lower, Detail, TmpFile, Line: String;
+  Tries, ResultCode, i: Integer;
+  Found: Boolean;
   Lines: TArrayOfString;
-  i: Integer;
-  Matched: Boolean;
 begin
   ExpectedPath := ExpandConstant('{app}\tools\sunshinesvc.exe');
-  TmpFile := ExpandConstant('{tmp}\sc_qc_sunshineservice.txt');
-  // Redirect to a temp file and parse in Pascal so we don't depend on cmd.exe
-  // performing %VAR% expansion on the captured path or on `find` substring
-  // matching (which would mis-handle e.g. "sunshinesvc.exe.bak").
+  Lower := Lowercase(ExpectedPath);
+
+  // Read the service binary path directly from the registry instead of
+  // parsing `sc qc` output. `sc.exe` localizes its column labels
+  // (e.g. on Spanish Windows BINARY_PATH_NAME becomes NOMBRE_RUTA_BINARIO),
+  // so the previous string-prefix match falsely failed on non-English
+  // locales even though install-service.bat had already verified the
+  // binPath via locale-safe `find /I <abs_path>` and exited 0.
+  //
+  // ImagePath is REG_EXPAND_SZ and may be wrapped in quotes when the path
+  // contains spaces (it always does under "Program Files"); substring match
+  // tolerates both forms, plus any future appended arguments.
+  //
+  // Retry a few times: SCM can take a moment to publish ImagePath after a
+  // successful `sc create`, especially when the service was just deleted
+  // out of "marked for deletion" state inside install-service.bat.
+  //
+  // The Services tree under HKLM\SYSTEM is shared between registry views. Use
+  // HKLM first so the check is not sensitive to Inno/Windows 64-bit view
+  // quirks, then fall back to HKLM64 for existing installers' behaviour.
+  ImagePath := '';
+  Found := False;
+  for Tries := 1 to 5 do
+  begin
+    Found := RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\SunshineService',
+                                 'ImagePath', ImagePath);
+    if not Found then
+      Found := RegQueryStringValue(HKLM64, 'SYSTEM\CurrentControlSet\Services\SunshineService',
+                                   'ImagePath', ImagePath);
+    if Found and (Pos(Lower, Lowercase(ImagePath)) > 0) then
+      Exit;  // happy path
+    Sleep(500);
+  end;
+
+  // Last-resort verification: query SCM and look for the expected absolute
+  // path anywhere in the output. This remains locale-safe because we do not
+  // parse localized labels such as BINARY_PATH_NAME/NOMBRE_RUTA_BINARIO.
+  TmpFile := ExpandConstant('{tmp}\sc_qc_sunshineservice_verify.txt');
+  ResultCode := -1;
   Exec(ExpandConstant('{cmd}'), '/c sc qc SunshineService > "' + TmpFile + '" 2>&1',
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Matched := False;
   if (ResultCode = 0) and LoadStringsFromFile(TmpFile, Lines) then
   begin
-    Lower := Lowercase(ExpectedPath);
     for i := 0 to GetArrayLength(Lines) - 1 do
     begin
-      Line := Trim(Lines[i]);
-      if (Pos('BINARY_PATH_NAME', Uppercase(Line)) = 1) and
-         (Pos(Lower, Lowercase(Line)) > 0) then
+      Line := Lines[i];
+      if Pos(Lower, Lowercase(Line)) > 0 then
       begin
-        Matched := True;
-        Break;
+        DeleteFile(TmpFile);
+        Exit;
       end;
     end;
   end;
   DeleteFile(TmpFile);
-  if not Matched then
-    RaiseException(CustomMessage('MsgServiceInstallFailed'));
+
+  // Build a detailed diagnostic so support reports include the actual
+  // mismatch rather than just the generic "could not install or verify"
+  // string. This makes it obvious whether the registry is empty (sc create
+  // never ran / was blocked) vs. pointing at an old install directory
+  // (stale SCM record from a previous install on a different drive).
+  if not Found then
+    Detail := 'ImagePath: <missing>'
+  else
+    Detail := 'ImagePath: ' + ImagePath;
+  Detail := Detail + #13#10 + 'Expected: ' + ExpectedPath;
+  Detail := Detail + #13#10 + 'sc qc exit: ' + IntToStr(ResultCode);
+  MsgBox(CustomMessage('MsgServiceInstallFailed') + #13#10 + #13#10 + Detail, mbError, MB_OK);
+  Abort();
 end;
 
 // Initialization: handle old NSIS upgrade

@@ -244,13 +244,19 @@ namespace proc {
       auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, _pipe.get(), ec, nullptr);
 
       if (ec) {
-        BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
         // We don't want any prep commands failing launch of the desktop.
         // This is to prevent the issue where users reboot their PC and need to log in with Sunshine.
         // permission_denied is typically returned when the user impersonation fails, which can happen when user is not signed in yet.
         if (!(_app.cmd.empty() && ec == std::errc::permission_denied)) {
+          BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
           return -1;
         }
+
+        BOOST_LOG(warning) << "Skipping Desktop prep command ["sv << cmd.do_cmd
+                           << "] because Sunshine could not run it under the user's session: "sv << ec.message()
+                           << ". Desktop streaming will continue, but this prep command's effect will not be applied."sv;
+        ec.clear();
+        continue;
       }
 
       child.wait(ec);
@@ -623,8 +629,7 @@ namespace proc {
         // 如果文件不存在则下载
         if (!std::filesystem::exists(local_path)) {
           BOOST_LOG(info) << "Downloading image from URL: " << original_url;
-          // 使用流式校验下载，如果Magic Byte不匹配会直接中断下载
-          if (!http::download_image_with_magic_check(original_url, local_path.string())) {
+          if (!http::download_public_cover_image(original_url, local_path.string())) {
             BOOST_LOG(warning) << "Failed to download image (or rejected by magic check) from URL: " << original_url;
             return DEFAULT_APP_IMAGE_PATH;
           }

@@ -273,7 +273,8 @@ namespace stream {
     RTP_PACKET rtp;
   };
 
-  constexpr std::uint8_t MIC_PACKET_TYPE_OPUS = 0x61;  // 'a'
+  // 本地解析客户端麦克风包时使用的 OPUS 包类型，避免与 moonlight-common-c 头文件宏同名。
+  constexpr std::uint8_t SUNSHINE_MIC_PACKET_TYPE_OPUS = 0x61;  // 'a'
 
   // 扩展的RTP包结构，支持16位包类型
   struct rtp_packet_ext_t {
@@ -2061,7 +2062,7 @@ namespace stream {
 
       // 8位包类型
       auto *header = (mic_packet_t *) mic_recv_buffer.data();
-      if (header->rtp.packetType == MIC_PACKET_TYPE_OPUS) {
+      if (header->rtp.packetType == SUNSHINE_MIC_PACKET_TYPE_OPUS) {
         size_t header_size = sizeof(mic_packet_t);
         if (received_bytes > header_size) {
           // 客户端按小端序发送序列号（MicrophoneStream.java 使用 LITTLE_ENDIAN）

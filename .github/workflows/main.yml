@@ -281,25 +281,6 @@ jobs:
           mv ./cpack_artifacts/Sunshine.exe ../artifacts/sunshine-windows-installer.exe
           mv ./cpack_artifacts/Sunshine.zip ../artifacts/sunshine-windows-portable.zip
 
-      - name: Generate Checksums
-        shell: pwsh
-        run: |
-          # Generate SHA256 checksums.
-          .\scripts\generate-checksums.ps1 -Path .\artifacts -Output "SHA256SUMS.txt"
-
-      - name: Package Windows Debug Info
-        working-directory: build
-        run: |
-          # use .dbg file extension for binaries to avoid confusion with real packages
-          Get-ChildItem -File -Recurse | `
-            % { Rename-Item -Path $_.PSPath -NewName $_.Name.Replace(".exe",".dbg") }
-
-          # save the binaries with debug info
-          7z -r `
-            "-xr!CMakeFiles" `
-            "-xr!cpack_artifacts" `
-            a "../artifacts/sunshine-win32-debuginfo.7z" "*.dbg"
-
       - name: Rename release assets
         shell: msys2 {0}
         run: |
@@ -317,6 +298,25 @@ jobs:
           # 重命名安装包和便携版
           mv artifacts/sunshine-windows-installer.exe "artifacts/Sunshine.${NEWTAG}.WindowsInstaller.exe"
           mv artifacts/sunshine-windows-portable.zip "artifacts/Sunshine.${NEWTAG}.WindowsPortable.zip"
+
+      - name: Generate Checksums
+        shell: pwsh
+        run: |
+          # 使用最终发布文件名生成校验清单，确保用户可以直接执行校验命令。
+          .\scripts\generate-checksums.ps1 -Path .\artifacts -Output "SHA256SUMS.txt"
+
+      - name: Package Windows Debug Info
+        working-directory: build
+        run: |
+          # use .dbg file extension for binaries to avoid confusion with real packages
+          Get-ChildItem -File -Recurse | `
+            % { Rename-Item -Path $_.PSPath -NewName $_.Name.Replace(".exe",".dbg") }
+
+          # save the binaries with debug info
+          7z -r `
+            "-xr!CMakeFiles" `
+            "-xr!cpack_artifacts" `
+            a "../artifacts/sunshine-win32-debuginfo.7z" "*.dbg"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

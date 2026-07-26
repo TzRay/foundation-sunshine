@@ -5,6 +5,7 @@
 #include <csignal>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -1169,6 +1170,43 @@ namespace platf {
     return create_boost_child_from_results(ret, cmd, ec, process_info);
   }
 
+  std::error_code
+  launch_gui_agent() {
+    std::wstring executable(32768, L'\0');
+    const auto executable_length = GetModuleFileNameW(
+      nullptr,
+      executable.data(),
+      static_cast<DWORD>(executable.size()));
+    if (executable_length == 0) {
+      return { static_cast<int>(GetLastError()), std::system_category() };
+    }
+    if (executable_length >= executable.size()) {
+      return { ERROR_INSUFFICIENT_BUFFER, std::system_category() };
+    }
+    executable.resize(executable_length);
+
+    const boost::filesystem::path sunshine_path { executable };
+    const auto gui_dir = sunshine_path.parent_path() / L"assets" / L"gui";
+    const auto gui_path = gui_dir / L"sunshine-gui.exe";
+    const auto attributes = GetFileAttributesW(gui_path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+      return { static_cast<int>(GetLastError()), std::system_category() };
+    }
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+      return std::make_error_code(std::errc::no_such_file_or_directory);
+    }
+
+    auto environment = boost::this_process::environment();
+    auto working_dir = gui_dir;
+    std::error_code ec;
+    const auto command = "\"" + to_utf8(gui_path.wstring()) + "\" --hidden";
+    auto child = run_command(false, false, command, working_dir, environment, nullptr, ec, nullptr);
+    if (!ec) {
+      child.detach();
+    }
+    return ec;
+  }
+
   /**
    * @brief Open a url in the default web browser.
    * @param url The url to open.
@@ -2090,19 +2128,79 @@ namespace platf {
     return 0;
   }
 
+  namespace {
+    std::chrono::nanoseconds
+    qpc_tick_magnitude_to_duration(std::uint64_t tick_magnitude, bool negative, int64_t frequency) {
+      if (frequency <= 0) {
+        return {};
+      }
+
+      constexpr std::uint64_t nanoseconds_per_second = std::nano::den;
+      constexpr std::uint64_t positive_limit = std::numeric_limits<int64_t>::max();
+      constexpr std::uint64_t negative_limit = positive_limit + 1;
+      const std::uint64_t result_limit = negative ? negative_limit : positive_limit;
+      const auto unsigned_frequency = static_cast<std::uint64_t>(frequency);
+
+      const auto whole_seconds = tick_magnitude / unsigned_frequency;
+      const auto remaining_ticks = tick_magnitude % unsigned_frequency;
+      if (whole_seconds > result_limit / nanoseconds_per_second) {
+        return negative ? std::chrono::nanoseconds::min() : std::chrono::nanoseconds::max();
+      }
+
+      const auto whole_nanoseconds = whole_seconds * nanoseconds_per_second;
+      std::uint64_t remaining_nanoseconds;
+      if (remaining_ticks <= std::numeric_limits<std::uint64_t>::max() / nanoseconds_per_second) {
+        remaining_nanoseconds = remaining_ticks * nanoseconds_per_second / unsigned_frequency;
+      }
+      else {
+        // QueryPerformanceFrequency is far below this branch in practice. Keep
+        // the fallback bounded for synthetic inputs that cannot be multiplied safely.
+        remaining_nanoseconds = std::min<std::uint64_t>(
+          static_cast<std::uint64_t>(
+            static_cast<long double>(remaining_ticks) * nanoseconds_per_second /
+            static_cast<long double>(unsigned_frequency)),
+          nanoseconds_per_second - 1);
+      }
+
+      if (remaining_nanoseconds > result_limit - whole_nanoseconds) {
+        return negative ? std::chrono::nanoseconds::min() : std::chrono::nanoseconds::max();
+      }
+
+      const auto nanosecond_magnitude = whole_nanoseconds + remaining_nanoseconds;
+      if (!negative) {
+        return std::chrono::nanoseconds { static_cast<int64_t>(nanosecond_magnitude) };
+      }
+      if (nanosecond_magnitude == negative_limit) {
+        return std::chrono::nanoseconds::min();
+      }
+      return std::chrono::nanoseconds { -static_cast<int64_t>(nanosecond_magnitude) };
+    }
+  }  // namespace
+
+  std::chrono::nanoseconds
+  qpc_ticks_to_duration(int64_t ticks, int64_t frequency) {
+    const bool negative = ticks < 0;
+    const auto tick_magnitude = negative ?
+                                  std::uint64_t { 0 } - static_cast<std::uint64_t>(ticks) :
+                                  static_cast<std::uint64_t>(ticks);
+    return qpc_tick_magnitude_to_duration(tick_magnitude, negative, frequency);
+  }
+
   std::chrono::nanoseconds
   qpc_time_difference(int64_t performance_counter1, int64_t performance_counter2) {
-    auto get_frequency = []() {
-      LARGE_INTEGER frequency;
-      frequency.QuadPart = 0;
-      QueryPerformanceFrequency(&frequency);
-      return frequency.QuadPart;
-    };
-    static const double frequency = get_frequency();
-    if (frequency) {
-      return std::chrono::nanoseconds((int64_t) ((performance_counter1 - performance_counter2) * frequency / std::nano::den));
-    }
-    return {};
+    static const int64_t frequency = []() {
+      LARGE_INTEGER qpc_frequency;
+      if (!QueryPerformanceFrequency(&qpc_frequency) || qpc_frequency.QuadPart <= 0) {
+        return int64_t { 0 };
+      }
+      return qpc_frequency.QuadPart;
+    }();
+
+    const bool negative = performance_counter1 < performance_counter2;
+    const auto tick_magnitude = negative ?
+                                  static_cast<std::uint64_t>(performance_counter2) - static_cast<std::uint64_t>(performance_counter1) :
+                                  static_cast<std::uint64_t>(performance_counter1) - static_cast<std::uint64_t>(performance_counter2);
+    return qpc_tick_magnitude_to_duration(tick_magnitude, negative, frequency);
   }
 
   std::wstring

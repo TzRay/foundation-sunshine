@@ -501,11 +501,17 @@ namespace platf::dxgi {
       return sealed_channel_attempt::fallback_allowed;
     }
 
+    if (open_status == display_device::vdd_ioctl::frame_channel_open_status::not_ready) {
+      m_frameChannelSelection = vdd_frame_channel::channel_selection::open_not_ready;
+      BOOST_LOG(debug) << "[vdd_capture] sealed frame channel is not ready; retrying producer transition"sv;
+      return sealed_channel_attempt::not_ready;
+    }
+
     if (m_frameChannelMode == vdd_frame_channel::channel_mode::sealed_required) {
       m_frameChannelSelection = vdd_frame_channel::channel_selection::sealed_required_failed;
       BOOST_LOG(error) << "[vdd_capture] SUNSHINE_VDD_FRAME_CHANNEL=sealed requested, "
                        << "but sealed frame channel open failed with status "sv
-                       << static_cast<int>(open_status);
+                       << display_device::vdd_ioctl::frame_channel_open_status_name(open_status);
       return sealed_channel_attempt::required_failed;
     }
 
@@ -514,7 +520,7 @@ namespace platf::dxgi {
         vdd_frame_channel::channel_selection::open_unsupported :
         vdd_frame_channel::channel_selection::open_failed;
     BOOST_LOG(warning) << "[vdd_capture] sealed frame channel open failed with status "sv
-                       << static_cast<int>(open_status)
+                       << display_device::vdd_ioctl::frame_channel_open_status_name(open_status)
                        << "; falling back to hardened legacy named channel"sv;
     return sealed_channel_attempt::fallback_allowed;
   }
@@ -632,6 +638,8 @@ namespace platf::dxgi {
       case sealed_channel_attempt::opened:
         return 0;
       case sealed_channel_attempt::required_failed:
+        return -1;
+      case sealed_channel_attempt::not_ready:
         return -1;
       case sealed_channel_attempt::skipped:
       case sealed_channel_attempt::fallback_allowed:
@@ -798,6 +806,14 @@ namespace platf::dxgi {
     unsigned int only_valid_height = 0;
   };
 
+  // A display-mode commit and the first frame from the replacement VDD swap
+  // chain are separate asynchronous events. Wait when no producer exists yet.
+  // A sole mismatched producer is unambiguous but cannot represent the DXGI
+  // desktop mode; report it immediately so the display factory can use DDX
+  // instead of waiting here and then ending the video session.
+  static constexpr auto vdd_producer_discovery_window = 8s;
+  static constexpr auto vdd_producer_discovery_retry_delay = 100ms;
+
   static vdd_probe_result_t
   probe_vdd_monitor_index(unsigned int target_w, unsigned int target_h, unsigned int max_probe) {
     vdd_probe_result_t result;
@@ -904,46 +920,47 @@ namespace platf::dxgi {
     return result;
   }
 
-  // Probes Global\ZakoVDD_Meta_<i> for valid producers and returns the index
-  // whose Width/Height exactly match target. A stale sole producer is not safe:
-  // the encoder and capture surfaces are already sized for the requested mode,
-  // so opening a mismatched producer can spin the stream in a reinit loop.
-  static int
+  // Prefer an exact producer match. A sole mismatched producer is returned as
+  // an explicit mismatch so the caller can fail over to DDX without waiting.
+  static vdd_frame_channel::producer_selection
   resolve_vdd_monitor_index(unsigned int target_w,
                             unsigned int target_h,
                             unsigned int max_probe = 16,
                             std::optional<std::chrono::steady_clock::time_point> deadline_override = std::nullopt) {
-    constexpr auto retry_window = 2500ms;
-    constexpr auto retry_delay = 100ms;
-
     vdd_probe_result_t last_result;
-    const auto deadline = deadline_override.value_or(std::chrono::steady_clock::now() + retry_window);
+    const auto deadline = deadline_override.value_or(std::chrono::steady_clock::now() + vdd_producer_discovery_window);
 
     for (;;) {
       last_result = probe_vdd_monitor_index(target_w, target_h, max_probe);
-      if (last_result.exact >= 0) {
-        BOOST_LOG(info) << "[vdd] resolved monitor index "sv << last_result.exact
+      const auto selection = vdd_frame_channel::select_producer(
+        last_result.exact,
+        last_result.only_valid,
+        static_cast<unsigned int>(last_result.valid_count)
+      );
+      if (selection.match == vdd_frame_channel::producer_match::exact) {
+        BOOST_LOG(info) << "[vdd] resolved monitor index "sv << selection.index
                         << " for "sv << target_w << "x"sv << target_h << " (exact match)"sv;
-        return last_result.exact;
+        return selection;
+      }
+      if (selection.match == vdd_frame_channel::producer_match::sole_mismatch) {
+        BOOST_LOG(warning) << "[vdd] sole producer monitor "sv << selection.index
+                           << " is "sv << last_result.only_valid_width
+                           << "x"sv << last_result.only_valid_height
+                           << ", while DXGI reports "sv << target_w << "x"sv << target_h
+                           << "; direct capture cannot represent this desktop mode"sv;
+        return selection;
       }
 
       if (std::chrono::steady_clock::now() >= deadline) {
         break;
       }
 
-      std::this_thread::sleep_for(retry_delay);
+      std::this_thread::sleep_for(vdd_producer_discovery_retry_delay);
     }
 
     if (last_result.valid_count == 0) {
       BOOST_LOG(warning) << "[vdd] no valid VDD producer found (no Meta_* mappings). "sv
                          << "Is the ZakoVDD driver installed and running?"sv;
-    }
-    else if (last_result.valid_count == 1 && last_result.only_valid >= 0) {
-      BOOST_LOG(warning) << "[vdd] sole VDD producer monitor "sv << last_result.only_valid
-                         << " is "sv << last_result.only_valid_width
-                         << "x"sv << last_result.only_valid_height
-                         << ", but requested "sv << target_w << "x"sv << target_h
-                         << "; refusing stale producer to avoid black screen/reinit loop."sv;
     }
     else {
       BOOST_LOG(warning) << "[vdd] "sv << last_result.valid_count
@@ -951,56 +968,59 @@ namespace platf::dxgi {
                          << target_w << "x"sv << target_h
                          << "."sv;
     }
-    return -1;
+    return {};
   }
 
-  static int
+  static vdd_frame_channel::producer_selection
   resolve_sealed_vdd_monitor_index(ID3D11Device *d3d_device,
                                    unsigned int target_w,
                                    unsigned int target_h,
                                    unsigned int max_probe = 16,
                                    std::optional<std::chrono::steady_clock::time_point> deadline_override = std::nullopt) {
-    constexpr auto retry_window = 2500ms;
-    constexpr auto retry_delay = 100ms;
-
     const auto device_luid = vdd_device_adapter_luid(d3d_device);
     if (!device_luid) {
-      return -1;
+      return {};
     }
 
     display_device::vdd_ioctl::frame_channel_caps sealed_caps {};
     if (probe_sealed_frame_channel(sealed_caps) != vdd_frame_channel::channel_selection::unknown) {
-      return -1;
+      return {};
     }
 
     vdd_probe_result_t last_result;
-    const auto deadline = deadline_override.value_or(std::chrono::steady_clock::now() + retry_window);
+    const auto deadline = deadline_override.value_or(std::chrono::steady_clock::now() + vdd_producer_discovery_window);
 
     for (;;) {
       last_result = probe_sealed_vdd_monitor_index(*device_luid, sealed_caps, target_w, target_h, max_probe);
-      if (last_result.exact >= 0) {
-        BOOST_LOG(info) << "[vdd] resolved sealed monitor index "sv << last_result.exact
+      const auto selection = vdd_frame_channel::select_producer(
+        last_result.exact,
+        last_result.only_valid,
+        static_cast<unsigned int>(last_result.valid_count)
+      );
+      if (selection.match == vdd_frame_channel::producer_match::exact) {
+        BOOST_LOG(info) << "[vdd] resolved sealed monitor index "sv << selection.index
                         << " for "sv << target_w << "x"sv << target_h << " (exact match)"sv;
-        return last_result.exact;
+        return selection;
+      }
+      if (selection.match == vdd_frame_channel::producer_match::sole_mismatch) {
+        BOOST_LOG(warning) << "[vdd] sole sealed producer monitor "sv << selection.index
+                           << " is "sv << last_result.only_valid_width
+                           << "x"sv << last_result.only_valid_height
+                           << ", while DXGI reports "sv << target_w << "x"sv << target_h
+                           << "; direct capture cannot represent this desktop mode"sv;
+        return selection;
       }
 
       if (std::chrono::steady_clock::now() >= deadline) {
         break;
       }
 
-      std::this_thread::sleep_for(retry_delay);
+      std::this_thread::sleep_for(vdd_producer_discovery_retry_delay);
     }
 
     if (last_result.valid_count == 0) {
       BOOST_LOG(warning) << "[vdd] no valid sealed VDD producer found for "sv
                          << target_w << "x"sv << target_h << "."sv;
-    }
-    else if (last_result.valid_count == 1 && last_result.only_valid >= 0) {
-      BOOST_LOG(warning) << "[vdd] sole sealed VDD producer monitor "sv << last_result.only_valid
-                         << " is "sv << last_result.only_valid_width
-                         << "x"sv << last_result.only_valid_height
-                         << ", but requested "sv << target_w << "x"sv << target_h
-                         << "; refusing stale producer to avoid black screen/reinit loop."sv;
     }
     else {
       BOOST_LOG(warning) << "[vdd] "sv << last_result.valid_count
@@ -1008,7 +1028,7 @@ namespace platf::dxgi {
                          << target_w << "x"sv << target_h
                          << "."sv;
     }
-    return -1;
+    return {};
   }
 
   int
@@ -1021,42 +1041,62 @@ namespace platf::dxgi {
     // Try to identify which VDD monitor backs this DXGI output by matching
     // dimensions. width/height come from DXGI DesktopCoordinates / orientation.
     // NOTE: We intentionally do NOT trigger CREATEMONITOR here. Sunshine's
-    // display-device layer (prepare_vdd) already manages monitor lifecycle, and
-    // adding a 3s NamedPipe round-trip per encoder probe wastes ~20s on every
-    // startup with no real benefit. If no producer is reachable, we just fail
-    // and let the upper layer try a different backend.
+    // display-device layer (prepare_vdd) already manages monitor lifecycle.
+    // Producer discovery is limited to a bounded wait because the mode commit,
+    // swap-chain replacement, and first shared frame are asynchronous.
     const auto target_w = static_cast<unsigned>(width_before_rotation);
     const auto target_h = static_cast<unsigned>(height_before_rotation);
     const auto frame_channel_mode =
       vdd_frame_channel_mode_env_override().value_or(vdd_frame_channel::channel_mode::auto_probe);
-    const auto producer_discovery_deadline = std::chrono::steady_clock::now() + 2500ms;
+    const auto producer_discovery_deadline = std::chrono::steady_clock::now() + vdd_producer_discovery_window;
 
-    int idx = -1;
+    vdd_frame_channel::producer_selection producer_selection;
     if (frame_channel_mode != vdd_frame_channel::channel_mode::legacy_named) {
-      idx = resolve_sealed_vdd_monitor_index(device.get(), target_w, target_h, 16, producer_discovery_deadline);
-      if (idx < 0 && frame_channel_mode == vdd_frame_channel::channel_mode::sealed_required) {
+      producer_selection = resolve_sealed_vdd_monitor_index(device.get(), target_w, target_h, 16, producer_discovery_deadline);
+      if (producer_selection.match == vdd_frame_channel::producer_match::sole_mismatch) {
+        BOOST_LOG(warning) << "[vdd] sealed producer resolution differs from the selected desktop; requesting DDX fallback"sv;
+        return -1;
+      }
+      if (producer_selection.match == vdd_frame_channel::producer_match::unavailable &&
+          frame_channel_mode == vdd_frame_channel::channel_mode::sealed_required) {
         BOOST_LOG(error) << "[vdd] SUNSHINE_VDD_FRAME_CHANNEL=sealed requested, "
                          << "but sealed producer discovery failed or found no matching producer for "sv
                          << target_w << "x"sv << target_h;
         return -1;
       }
-      if (idx < 0) {
+      if (producer_selection.match == vdd_frame_channel::producer_match::unavailable) {
         BOOST_LOG(warning) << "[vdd] sealed producer discovery was unavailable or found no matching monitor; "
                            << "falling back to legacy Meta_* discovery"sv;
       }
     }
 
-    if (idx < 0) {
-      idx = resolve_vdd_monitor_index(target_w, target_h, 16, producer_discovery_deadline);
+    if (producer_selection.match == vdd_frame_channel::producer_match::unavailable) {
+      producer_selection = resolve_vdd_monitor_index(target_w, target_h, 16, producer_discovery_deadline);
     }
-    if (idx < 0) {
+    if (producer_selection.match == vdd_frame_channel::producer_match::sole_mismatch) {
+      BOOST_LOG(warning) << "[vdd] legacy producer resolution differs from the selected desktop; requesting DDX fallback"sv;
       return -1;
     }
-    monitor_idx = static_cast<unsigned int>(idx);
+    if (producer_selection.match == vdd_frame_channel::producer_match::unavailable) {
+      return -1;
+    }
+    monitor_idx = static_cast<unsigned int>(producer_selection.index);
 
-    if (dup.init(device.get(), monitor_idx) != 0) {
-      BOOST_LOG(error) << "[vdd] vdd_capture_t::init failed for monitor "sv << monitor_idx;
-      return -1;
+    for (;;) {
+      if (dup.init(device.get(), monitor_idx) == 0) {
+        break;
+      }
+
+      if (std::chrono::steady_clock::now() >= producer_discovery_deadline) {
+        BOOST_LOG(error) << "[vdd] vdd_capture_t::init failed for monitor "sv << monitor_idx
+                         << " before the producer discovery deadline; last_channel_selection="sv
+                         << vdd_frame_channel::channel_selection_name(dup.frame_channel_selection());
+        return -1;
+      }
+
+      BOOST_LOG(debug) << "[vdd] VDD capture attach is not stable yet; retrying monitor "sv
+                       << monitor_idx;
+      std::this_thread::sleep_for(vdd_producer_discovery_retry_delay);
     }
 
     // Use producer-reported format as our capture format. complete_img() / image

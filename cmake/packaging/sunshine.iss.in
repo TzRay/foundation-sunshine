@@ -19,7 +19,7 @@
 AppId={{B16E5C0D-7B8A-4E3B-9F1A-2D4C6E8F0A1B}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppVerName=Sunshine Foundation Game Streaming Server v{#MyAppVersion}
+AppVerName=Foundation Sunshine Game Streaming Server v{#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/support
@@ -48,7 +48,7 @@ WizardImageAlphaFormat=defined
 WizardSizePercent=120
 ; 版本信息 (VersionInfoVersion requires X.X.X.X format, use AppVersion for display)
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoDescription=Sunshine Foundation Game Streaming Server
+VersionInfoDescription=Foundation Sunshine Game Streaming Server
 VersionInfoProductName={#MyAppName}
 ; 其他
 LicenseFile={#MyLicenseFile}
@@ -74,6 +74,7 @@ Name: "chinesesimplified"; MessagesFile: "@CMAKE_SOURCE_DIR@\cmake\packaging\Chi
 ; English custom messages
 english.ComponentApplication=Sunshine main application
 english.ComponentAssets=Required assets (shaders, web UI)
+english.ComponentGUI=Sunshine GUI and tray agent (required)
 english.ComponentVDD=Zako Virtual Display Driver (HDR)
 english.ComponentAutostart=Launch on system startup
 english.ComponentFirewall=Add firewall exclusions
@@ -114,6 +115,7 @@ english.StatusStoppingProcesses=Stopping running Sunshine processes...
 ; Chinese Simplified custom messages
 chinesesimplified.ComponentApplication=Sunshine 主程序
 chinesesimplified.ComponentAssets=必要资源（着色器、Web UI）
+chinesesimplified.ComponentGUI=Sunshine GUI 与托盘代理（必需）
 chinesesimplified.ComponentVDD=Zako 虚拟显示驱动（HDR）
 chinesesimplified.ComponentAutostart=开机自动启动
 chinesesimplified.ComponentFirewall=添加防火墙规则
@@ -160,6 +162,7 @@ Name: "custom"; Description: "{cm:TypeCustom}"; Flags: iscustom
 [Components]
 Name: "application"; Description: "{cm:ComponentApplication}"; Types: recommended full compact custom; Flags: fixed
 Name: "assets"; Description: "{cm:ComponentAssets}"; Types: recommended full compact custom; Flags: fixed
+Name: "gui"; Description: "{cm:ComponentGUI}"; Types: recommended full compact custom; Flags: fixed
 Name: "vdd"; Description: "{cm:ComponentVDD} — {cm:ComponentVDDDesc}"; Types: recommended full; ExtraDiskSpaceRequired: 2097152
 Name: "firewall"; Description: "{cm:ComponentFirewall} — {cm:ComponentFirewallDesc}"; Types: recommended full compact
 Name: "autostart"; Description: "{cm:ComponentAutostart} — {cm:ComponentAutostartDesc}"; Types: recommended full
@@ -204,8 +207,12 @@ Source: "{#MySourceDir}\scripts\IMAGE_MIGRATION.md"; DestDir: "{app}\scripts"; F
 ; PATH management
 Source: "{#MySourceDir}\scripts\update-path.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion; Components: application
 
-; Assets (includes GUI, shaders, web UI, etc.)
-Source: "{#MySourceDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: assets
+; Assets (shaders, web UI, etc.)
+Source: "{#MySourceDir}\assets\*"; DestDir: "{app}\assets"; Excludes: "gui\*"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: assets
+
+; Required GUI and user-session tray agent
+Source: "{#MySourceDir}\assets\gui\{#MyAppGUIExeName}"; DestDir: "{app}\assets\gui"; Flags: ignoreversion; Components: gui
+Source: "{#MySourceDir}\assets\gui\WebView2Loader.dll"; DestDir: "{app}\assets\gui"; Flags: ignoreversion skipifsourcedoesntexist; Components: gui
 
 ; Helper tools
 Source: "{#MySourceDir}\tools\device-toggler.exe"; DestDir: "{app}\tools"; Flags: ignoreversion; Components: assets
@@ -225,12 +232,14 @@ Source: "{#MySourceDir}\scripts\delete-firewall-rule.bat"; DestDir: "{app}\scrip
 
 ; Virtual Display Driver scripts & files
 Source: "{#MySourceDir}\scripts\install-vdd.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "{#MySourceDir}\scripts\vdd-device-helper.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#MySourceDir}\scripts\uninstall-vdd.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#MySourceDir}\scripts\driver\*"; DestDir: "{app}\scripts\driver"; Flags: ignoreversion recursesubdirs
 
 ; Gamepad scripts
 Source: "{#MySourceDir}\scripts\install-gamepad.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#MySourceDir}\scripts\uninstall-gamepad.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "{#MySourceDir}\scripts\gamepad\*"; DestDir: "{app}\scripts\gamepad"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist; Components: gamepad
 
 ; Virtual Mouse Driver scripts & files
 Source: "{#MySourceDir}\scripts\vmouse\install-vmouse.bat"; DestDir: "{app}\scripts\vmouse"; Flags: ignoreversion
@@ -250,13 +259,13 @@ Source: "{#MySourceDir}\tools\audio-info.exe"; DestDir: "{app}\tools"; Flags: ig
 [Icons]
 ; Start Menu shortcuts
 Name: "{group}\Sunshine"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--shortcut"; IconFilename: "{app}\{#MyAppExeName}"
-Name: "{group}\Sunshine GUI"; Filename: "{app}\assets\gui\{#MyAppGUIExeName}"; IconFilename: "{app}\assets\gui\{#MyAppGUIExeName}"
+Name: "{group}\Sunshine GUI"; Filename: "{app}\assets\gui\{#MyAppGUIExeName}"; IconFilename: "{app}\assets\gui\{#MyAppGUIExeName}"; Components: gui
 Name: "{group}\Sunshine Tools"; Filename: "{app}\tools"; IconFilename: "{app}\{#MyAppExeName}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 
 ; Desktop shortcuts (optional, controlled by Tasks)
 Name: "{autodesktop}\Sunshine"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--shortcut"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{autodesktop}\Sunshine GUI"; Filename: "{app}\assets\gui\{#MyAppGUIExeName}"; IconFilename: "{app}\assets\gui\{#MyAppGUIExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\Sunshine GUI"; Filename: "{app}\assets\gui\{#MyAppGUIExeName}"; IconFilename: "{app}\assets\gui\{#MyAppGUIExeName}"; Tasks: desktopicon; Components: gui
 
 ; Install dir shortcut
 Name: "{app}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--shortcut"; IconFilename: "{app}\{#MyAppExeName}"
@@ -268,30 +277,26 @@ Root: HKLM64; Subkey: "SOFTWARE\AlkaidLab\Sunshine"; ValueType: string; ValueNam
 [Run]
 ; Post-install: drop explicit ACEs (inherit from parent) + clear READONLY
 ; attribute on files & dirs. The latter is what fixes the rare "Sunshine
-Filename: "{cmd}"; Parameters: "/c icacls ""{app}"" /reset /T /C > ""{tmp}\sunshine-icacls-reset.log"" 2>&1 & attrib -R ""{app}\*.*"" /S /D > ""{tmp}\sunshine-attrib-clear.log"" 2>&1"; StatusMsg: "{cm:StatusResetPermissions}"; Flags: runhidden waituntilterminated
+Filename: "{cmd}"; Parameters: "/c icacls ""{app}"" /reset /T /C > ""{tmp}\sunshine-icacls-reset.log"" 2>&1 & attrib -R ""{app}\*.*"" /S /D > ""{tmp}\sunshine-attrib-clear.log"" 2>&1"; StatusMsg: "{cm:StatusResetPermissions}"; Flags: runhidden waituntilterminated; Check: ShouldRepairInstallPermissions
 Filename: "{app}\scripts\update-path.bat"; Parameters: "add"; StatusMsg: "{cm:StatusUpdatePath}"; Flags: runhidden waituntilterminated
 Filename: "{app}\scripts\migrate-config.bat"; StatusMsg: "{cm:StatusMigrateConfig}"; Flags: runhidden waituntilterminated
 Filename: "{app}\scripts\add-firewall-rule.bat"; StatusMsg: "{cm:StatusFirewall}"; Flags: runhidden waituntilterminated; Components: firewall
-Filename: "{app}\scripts\install-vdd.bat"; StatusMsg: "{cm:StatusInstallVDD}"; Flags: runhidden waituntilterminated; Components: vdd
+; Leave a healthy older VDD active during unattended upgrades; the GUI offers an explicit repair action.
+Filename: "{app}\scripts\install-vdd.bat"; Parameters: "--preserve-healthy-existing"; StatusMsg: "{cm:StatusInstallVDD}"; Flags: runhidden waituntilterminated; Components: vdd
 Filename: "{app}\scripts\install-gamepad.bat"; StatusMsg: "{cm:StatusInstallGamepad}"; Flags: runhidden waituntilterminated; Components: gamepad
 Filename: "{app}\scripts\vmouse\install-vmouse.bat"; StatusMsg: "{cm:StatusInstallVmouse}"; Flags: runhidden waituntilterminated; Components: vmouse
 Filename: "{app}\scripts\install-service.bat"; StatusMsg: "{cm:StatusInstallService}"; Flags: runhidden waituntilterminated; AfterInstall: VerifyServiceInstalled
 Filename: "{app}\scripts\autostart-service.bat"; StatusMsg: "{cm:StatusAutostart}"; Flags: runhidden waituntilterminated; Components: autostart
 
 ; Finish page actions - user selectable
-; Use explorer.exe to launch GUI so it always runs as the non-elevated current user,
-; even though the installer itself is running with admin privileges.
-; `runascurrentuser` is required: without it Inno 6 routes postinstall items
-; through its SpawnServer to demote to the originating user. That helper
-; expects to talk to Inno's own rundll32-based child and fails with
-; "CallSpawnServer: Unexpected response: $0" the moment explorer.exe forwards
-; the request to the existing shell instance and exits. We don't need Inno's
-; demotion here anyway — the explorer.exe trick performs the de-elevation at
-; the Windows shell level on its own.
-Filename: "https://docs.qq.com/aio/DSGdQc3htbFJjSFdO?p=DXpTjzl2kZwBjN7jlRMkRJ"; Description: "{cm:FinishOpenDocs}"; Flags: postinstall shellexec runascurrentuser unchecked nowait skipifsilent
-Filename: "{win}\explorer.exe"; Parameters: """{app}\assets\gui\{#MyAppGUIExeName}"""; Description: "{cm:FinishLaunchGUI}"; Flags: postinstall nowait skipifsilent runascurrentuser
+Filename: "https://docs.qq.com/aio/DSGdQc3htbFJjSFdO?p=DXpTjzl2kZwBjN7jlRMkRJ"; Description: "{cm:FinishOpenDocs}"; Flags: postinstall shellexec runasoriginaluser unchecked nowait skipifsilent
+; Launch the user-session agent with the original desktop token. The GUI then
+; owns and reconciles its HKCU autostart entry from the correct user context.
+Filename: "{app}\assets\gui\{#MyAppGUIExeName}"; Description: "{cm:FinishLaunchGUI}"; Flags: postinstall nowait skipifsilent runasoriginaluser; Components: gui
 
 [UninstallRun]
+; Remove the per-user GUI startup entry before terminating the agent.
+Filename: "{app}\assets\gui\{#MyAppGUIExeName}"; Parameters: "--remove-autostart"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveGUIAutoStart"; Check: FileExists(ExpandConstant('{app}\assets\gui\{#MyAppGUIExeName}'))
 ; Stop running processes first. We force-kill the service binary
 ; (sunshinesvc.exe) here as well, otherwise `sc stop` later may block waiting
 ; on its stop handler — which is the typical "uninstaller appears frozen" symptom.
@@ -338,6 +343,7 @@ var
   BrandTitle: TNewStaticText;
   BrandSubtitle: TNewStaticText;
   AccentBar: TBevel;
+  ExistingInnoInstall: Boolean;
 
 procedure InitializeWizard();
 var
@@ -597,6 +603,42 @@ begin
   RegDeleteKeyIfEmpty(HKLM32, 'SOFTWARE\AlkaidLab');
 end;
 
+function DetectExistingInnoInstall(): Boolean;
+var
+  InstallDir: String;
+begin
+  Result := RegQueryStringValue(HKLM64, 'SOFTWARE\AlkaidLab\Sunshine', 'InstallDir', InstallDir);
+  if not Result then
+    Result := RegQueryStringValue(HKLM32, 'SOFTWARE\AlkaidLab\Sunshine', 'InstallDir', InstallDir);
+  Result := Result and (InstallDir <> '') and DirExists(InstallDir);
+end;
+
+function ShouldRepairInstallPermissions(): Boolean;
+var
+  ResultCode: Integer;
+  VerifyLog, Params: String;
+begin
+  Result := False;
+  if not ExistingInnoInstall then
+    Exit;
+
+  // Verification is read-only and substantially cheaper than rewriting every
+  // ACL. Only legacy installs with malformed/non-canonical ACLs take the slow
+  // recursive reset path.
+  VerifyLog := ExpandConstant('{tmp}\sunshine-icacls-verify.log');
+  Params := '/c icacls "' + ExpandConstant('{app}') +
+            '" /verify /T /C > "' + VerifyLog + '" 2>&1';
+  ResultCode := -1;
+  if not Exec(ExpandConstant('{cmd}'), Params, '', SW_HIDE,
+              ewWaitUntilTerminated, ResultCode) then
+    Result := True
+  else
+    Result := ResultCode <> 0;
+
+  if not Result then
+    DeleteFile(VerifyLog);
+end;
+
 procedure VerifyServiceInstalled();
 var
   ExpectedPath, ImagePath, Lower, Detail, TmpFile, Line: String;
@@ -685,6 +727,7 @@ var
   ResultCode: Integer;
   Waited: Integer;
 begin
+  ExistingInnoInstall := DetectExistingInnoInstall();
   Result := True;
 
   if not DetectOldNSISInstall() then

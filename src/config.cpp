@@ -8,6 +8,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -48,6 +49,10 @@ using namespace std::literals;
 
 #define APPS_JSON_PATH platf::appdata().string() + "/apps.json"
 namespace config {
+
+  namespace {
+    std::mutex config_file_mutex;
+  }
 
   namespace nv {
 
@@ -409,6 +414,7 @@ namespace config {
     false,  // vdd_headless_create_enabled
     false,  // vdd_reuse (default: recreate VDD for each client)
     true,  // vdd_borrowed_texture
+    true,  // vdd_vulkan_hdr_bridge (automatic for HDR VDD sessions)
     {},  // nv_legacy
 
     {
@@ -1328,6 +1334,7 @@ namespace config {
     bool_f(vars, "vdd_headless_create", video.vdd_headless_create_enabled);
     bool_f(vars, "vdd_reuse", video.vdd_reuse);
     bool_f(vars, "vdd_borrowed_texture", video.vdd_borrowed_texture);
+    bool_f(vars, "vdd_vulkan_hdr_bridge", video.vdd_vulkan_hdr_bridge);
 
     // Whether to composite the host mouse cursor into the captured frames.
     // The runtime toggle Ctrl+Alt+Shift+N (handled in input.cpp) overrides this at runtime.
@@ -1750,6 +1757,7 @@ namespace config {
 
   bool
   update_config(const std::map<std::string, std::string> &updates) {
+    std::lock_guard lock { config_file_mutex };
     try {
       // 读取现有配置文件
       std::map<std::string, std::string> configMap;
@@ -1807,12 +1815,14 @@ namespace config {
 
   bool
   update_full_config(const std::map<std::string, std::string> &fullConfig) {
+    std::lock_guard lock { config_file_mutex };
     try {
       // 不需要保存到配置文件的只读字段（API响应字段，不是配置项）
       const std::set<std::string> readonlyFields = {
         "status",           // API响应状态，不是配置项
         "platform",         // 平台信息，编译时确定，只读
         "version",          // 版本号，只读
+        "active_encoder",   // 运行时探测后实际使用的编码器，只读
         "display_devices",  // 显示设备列表，运行时枚举，只读
         "adapters",         // 适配器列表，运行时枚举，只读
         "pair_name",        // 配对名称，由系统生成，只读

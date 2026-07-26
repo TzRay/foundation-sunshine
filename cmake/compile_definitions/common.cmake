@@ -69,6 +69,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/display_device/settings.h"
         "${CMAKE_SOURCE_DIR}/src/display_device/to_string.cpp"
         "${CMAKE_SOURCE_DIR}/src/display_device/to_string.h"
+        "${CMAKE_SOURCE_DIR}/src/display_device/vdd_capability.cpp"
+        "${CMAKE_SOURCE_DIR}/src/display_device/vdd_capability.h"
         "${CMAKE_SOURCE_DIR}/src/display_device/vdd_utils.cpp"
         "${CMAKE_SOURCE_DIR}/src/display_device/vdd_utils.h"
         "${CMAKE_SOURCE_DIR}/src/display_device/vdd_ioctl.cpp"
@@ -149,6 +151,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/abr.h"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.cpp"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.h"
+        "${CMAKE_SOURCE_DIR}/src/launch_session_manager.cpp"
+        "${CMAKE_SOURCE_DIR}/src/launch_session_manager.h"
         "${CMAKE_SOURCE_DIR}/src/perf_recorder.cpp"
         "${CMAKE_SOURCE_DIR}/src/perf_recorder.h"
         "${CMAKE_SOURCE_DIR}/src/confighttp.cpp"
@@ -173,16 +177,21 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/input_activity.h"
         "${CMAKE_SOURCE_DIR}/src/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/audio.h"
+        "${CMAKE_SOURCE_DIR}/src/http_util.h"
         "${CMAKE_SOURCE_DIR}/src/platform/common.h"
         "${CMAKE_SOURCE_DIR}/src/process.cpp"
         "${CMAKE_SOURCE_DIR}/src/process.h"
         "${CMAKE_SOURCE_DIR}/src/network.cpp"
         "${CMAKE_SOURCE_DIR}/src/network.h"
         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
-        "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
-        "${CMAKE_SOURCE_DIR}/src/system_tray.h"
-        "${CMAKE_SOURCE_DIR}/src/system_tray_i18n.cpp"
-        "${CMAKE_SOURCE_DIR}/src/system_tray_i18n.h"
+        "${CMAKE_SOURCE_DIR}/src/tray/system_tray.cpp"
+        "${CMAKE_SOURCE_DIR}/src/tray/system_tray.h"
+        "${CMAKE_SOURCE_DIR}/src/tray/system_tray_i18n.cpp"
+        "${CMAKE_SOURCE_DIR}/src/tray/system_tray_i18n.h"
+        "${CMAKE_SOURCE_DIR}/src/tray/tray_http.cpp"
+        "${CMAKE_SOURCE_DIR}/src/tray/tray_http.h"
+        "${CMAKE_SOURCE_DIR}/src/tray/tray_state.cpp"
+        "${CMAKE_SOURCE_DIR}/src/tray/tray_state.h"
         "${CMAKE_SOURCE_DIR}/src/task_pool.h"
         "${CMAKE_SOURCE_DIR}/src/thread_pool.h"
         "${CMAKE_SOURCE_DIR}/src/thread_safe.h"
@@ -198,6 +207,7 @@ endif()
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ASSETS_DIR="${SUNSHINE_ASSETS_DIR_DEF}")
 
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=${SUNSHINE_TRAY})
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_GUI_TRAY=${SUNSHINE_GUI_TRAY})
 
 # Publisher metadata - escape spaces for proper compilation
 string(REPLACE " " "_" SUNSHINE_PUBLISHER_NAME_SAFE "${SUNSHINE_PUBLISHER_NAME}")

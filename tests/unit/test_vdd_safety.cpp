@@ -3,6 +3,9 @@
 #ifdef _WIN32
 
 #include "src/display_device/vdd_control_ioctl.h"
+#include "src/display_device/vdd_capability.h"
+#include "src/display_device/vdd_ioctl.h"
+#include "src/display_device/vdd_utils.h"
 #include "src/platform/windows/display_device/settings_topology.h"
 #include "src/platform/windows/vdd_frame_channel.h"
 
@@ -50,6 +53,16 @@ namespace {
   }
 
 }  // namespace
+
+TEST(VddCapability, ExposesStableStateNames) {
+  using namespace display_device::vdd_capability;
+
+  EXPECT_EQ(to_string(state_e::ready), "ready");
+  EXPECT_EQ(to_string(state_e::driver_missing), "driver_missing");
+  EXPECT_EQ(to_string(state_e::driver_unreachable), "driver_unreachable");
+  EXPECT_EQ(to_string(state_e::unsupported_platform), "unsupported_platform");
+  EXPECT_EQ(capability_version, 1);
+}
 
 TEST(VddBaselineSafety, DetectsVddOnlyTopology) {
   using namespace display_device;
@@ -159,6 +172,39 @@ TEST(VddFrameChannelSafety, BoundsPostEventAcquireWait) {
             consumer_acquire_wait_budget_ms);
 }
 
+TEST(VddModeRefreshSafety, MatchesAdvertisedModesWithRefreshTolerance) {
+  using namespace display_device;
+
+  const display_mode_t requested {
+    {2340, 1080},
+    {11988, 100},
+  };
+
+  EXPECT_TRUE(vdd_utils::advertised_mode_matches(2340, 1080, 120, requested));
+  EXPECT_TRUE(vdd_utils::advertised_mode_matches(2340, 1080, 119, requested));
+  EXPECT_FALSE(vdd_utils::advertised_mode_matches(2560, 1440, 120, requested));
+  EXPECT_FALSE(vdd_utils::advertised_mode_matches(2340, 1080, 60, requested));
+
+  auto invalid = requested;
+  invalid.refresh_rate.denominator = 0;
+  EXPECT_FALSE(vdd_utils::advertised_mode_matches(2340, 1080, 120, invalid));
+}
+
+TEST(VddFrameChannelSafety, SelectsExactOrSoleProducerWithoutAmbiguity) {
+  using namespace platf::dxgi::vdd_frame_channel;
+
+  auto selection = select_producer(3, 7, 2);
+  EXPECT_EQ(selection.index, 3);
+  EXPECT_EQ(selection.match, producer_match::exact);
+
+  selection = select_producer(-1, 7, 1);
+  EXPECT_EQ(selection.index, 7);
+  EXPECT_EQ(selection.match, producer_match::sole_mismatch);
+
+  EXPECT_EQ(select_producer(-1, -1, 0).match, producer_match::unavailable);
+  EXPECT_EQ(select_producer(-1, 7, 2).match, producer_match::unavailable);
+}
+
 TEST(VddFrameChannelSafety, ReadsOnlyStableMetadataSnapshots) {
   using namespace platf::dxgi::vdd_frame_channel;
 
@@ -204,6 +250,16 @@ TEST(VddFrameChannelSafety, ParsesFrameChannelModes) {
 
   EXPECT_FALSE(parse_channel_mode("host_owned"));
   EXPECT_FALSE(parse_channel_mode(""));
+}
+
+TEST(VddFrameChannelSafety, NamesFrameChannelOpenStatuses) {
+  using namespace display_device::vdd_ioctl;
+
+  EXPECT_STREQ(frame_channel_open_status_name(frame_channel_open_status::opened), "opened");
+  EXPECT_STREQ(frame_channel_open_status_name(frame_channel_open_status::not_ready), "not_ready");
+  EXPECT_STREQ(frame_channel_open_status_name(frame_channel_open_status::unsupported), "unsupported");
+  EXPECT_STREQ(frame_channel_open_status_name(frame_channel_open_status::interface_missing), "interface_missing");
+  EXPECT_STREQ(frame_channel_open_status_name(frame_channel_open_status::failed), "failed");
 }
 
 TEST(VddFrameChannelSafety, DefinesSealedChannelCapsAbi) {

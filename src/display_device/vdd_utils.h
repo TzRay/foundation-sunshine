@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -22,9 +23,6 @@ namespace display_device::vdd_utils {
   inline constexpr auto kInitialRetryDelay = 500ms;
   inline constexpr auto kMaxRetryDelay = 3000ms;
 
-  extern const wchar_t *kVddPipeName;
-  extern const DWORD kPipeTimeoutMs;
-  extern const DWORD kPipeBufferSize;
   extern const std::chrono::milliseconds kDefaultDebounceInterval;
 
   // HDR亮度范围结构
@@ -50,12 +48,90 @@ namespace display_device::vdd_utils {
 
   // VDD设置结构
   struct VddSettings {
-    std::string resolutions;
-    std::string fps;
     std::vector<resolution_t> resolution_modes;
     std::vector<unsigned int> refresh_rates_hz;
-    bool needs_update = false;
   };
+
+  constexpr bool
+  advertised_mode_matches(unsigned int width,
+    unsigned int height,
+    unsigned int refresh_hz,
+    const display_mode_t &requested_mode) {
+    if (requested_mode.refresh_rate.denominator == 0 ||
+        width != requested_mode.resolution.width ||
+        height != requested_mode.resolution.height) {
+      return false;
+    }
+
+    const auto advertised_scaled =
+      static_cast<std::uint64_t>(refresh_hz) * requested_mode.refresh_rate.denominator;
+    const auto requested_scaled =
+      static_cast<std::uint64_t>(requested_mode.refresh_rate.numerator);
+    const auto difference = advertised_scaled > requested_scaled ?
+                              advertised_scaled - requested_scaled :
+                              requested_scaled - advertised_scaled;
+    return difference <= requested_mode.refresh_rate.denominator;
+  }
+
+  /**
+   * @brief Check whether Windows exposes a requested mode for a display device.
+   * @details SETMODES updates the driver mode list, but an existing IddCx
+   *          monitor can retain a stale monitor-description list. This checks
+   *          the effective modes published to Windows, not just IOCTL success.
+   */
+  bool
+  is_mode_advertised(const std::string &device_id, const display_mode_t &requested_mode);
+
+  struct vdd_status_t {
+    std::string state;
+    bool installed = false;
+    bool running = false;
+    bool control_available = false;
+    bool monitor_active = false;
+    bool problem_code_valid = false;
+    std::uint32_t problem_code = 0;
+
+    constexpr bool
+    is_usable() const {
+      return installed && problem_code_valid && running;
+    }
+  };
+
+  enum class vdd_prerequisite_e {
+    usable,
+    not_installed,
+    unavailable,
+  };
+
+  constexpr vdd_prerequisite_e
+  classify_vdd_prerequisite(const vdd_status_t &status) {
+    if (status.is_usable()) {
+      return vdd_prerequisite_e::usable;
+    }
+    return status.installed ? vdd_prerequisite_e::unavailable : vdd_prerequisite_e::not_installed;
+  }
+
+  constexpr std::string_view
+  classify_vdd_state(bool installed, bool running, bool control_available, bool problem_code_valid, std::uint32_t problem_code) {
+    if (!installed) {
+      return "not_installed";
+    }
+    if (!problem_code_valid) {
+      return "unknown";
+    }
+    if (!running) {
+      return problem_code == 14 ? "reboot_required" : "unhealthy";
+    }
+    return control_available ? "ready" : "degraded";
+  }
+
+  /**
+   * @brief Return a fast, read-only VDD prerequisite snapshot.
+   * @details This only performs read-only device and IOCTL probes, so callers
+   *          can use it in Web status polling and stream startup.
+   */
+  vdd_status_t
+  get_vdd_status();
 
   // 指数退避计算
   std::chrono::milliseconds
@@ -64,17 +140,6 @@ namespace display_device::vdd_utils {
   // VDD命令执行
   bool
   execute_vdd_command(const std::string &action);
-
-  // 管道相关函数
-  HANDLE
-  connect_to_pipe_with_retry(const wchar_t *pipe_name, int max_retries = 3);
-
-  bool
-  execute_pipe_command(const wchar_t *pipe_name, const wchar_t *command, std::string *response = nullptr, bool *timed_out = nullptr);
-
-  // 驱动重载函数
-  bool
-  reload_driver();
 
   /**
    * @brief Ensure ZakoVDD renders the cursor into the framebuffer instead of exposing a hardware cursor plane.
@@ -89,13 +154,13 @@ namespace display_device::vdd_utils {
   /**
    * @brief Outcome of attempting a live SETMODES update.
    * @details Lets callers distinguish "driver accepted" / "driver rejected" /
-   *          "feature not present" / "config is unusable" so the persistent
-   *          XML fallback can be used when the live path is not available.
+   *          "feature not present" / "config is unusable" without conflating
+   *          transport failure with invalid input.
    */
   enum class set_vdd_result {
     ok,                 ///< Driver accepted the live mode update.
     failed,             ///< Driver reachable but rejected the IOCTL.
-    interface_missing,  ///< IOCTL interface not present (old driver) -> safe to XML-fallback.
+    interface_missing,  ///< IOCTL interface not present (old driver).
     invalid_config,     ///< Resolution/refresh rate missing or unusable; nothing was sent.
   };
 
@@ -105,7 +170,7 @@ namespace display_device::vdd_utils {
    *          This does not persist the session resolution to vdd_settings.xml.
    * @param config Parsed display configuration containing the requested session mode.
    * @param settings Full standard mode list plus the requested session mode.
-   * @return Typed outcome; callers can XML-fallback when the live path is unavailable.
+   * @return Typed outcome describing whether the complete live update was accepted.
    */
   set_vdd_result
   set_vdd_session_mode(const parsed_config_t &config, const VddSettings &settings);
@@ -135,6 +200,13 @@ namespace display_device::vdd_utils {
    */
   bool
   create_vdd_monitor(const std::string &client_identifier = "", const hdr_brightness_t &hdr_brightness = {}, const physical_size_t &physical_size = {});
+
+  /**
+   * Create a VDD for a user-session provider without displaying Core UI.
+   * The provider owns confirmation; Core performs bounded topology setup.
+   */
+  bool
+  create_vdd_monitor_noninteractive();
 
   bool
   destroy_vdd_monitor();

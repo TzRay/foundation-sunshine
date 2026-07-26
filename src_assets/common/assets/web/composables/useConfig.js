@@ -1,6 +1,7 @@
 import { ref } from 'vue'
 import { trackEvents } from '../config/firebase.js'
-import { apiFetch, apiJson } from '../utils/apiFetch.js'
+import { getBootstrapConfig } from '../config/bootstrapData.js'
+import { apiFetch } from '../utils/apiFetch.js'
 import { deepClone, safeJsonParse } from '../utils/helpers.js'
 
 // 平台相关的标签页排除规则
@@ -65,6 +66,7 @@ const DEFAULT_TABS = [
       capture_target: 'display',
       capture_compute_shader: 'auto',
       vdd_borrowed_texture: 'enabled',
+      vdd_vulkan_hdr_bridge: 'enabled',
       window_title: '',
       display_device_prep: 'no_operation',
       vdd_reuse: 'disabled',
@@ -420,7 +422,7 @@ export function useConfig() {
    */
   const loadConfig = async () => {
     try {
-      const data = await apiJson('/api/config')
+      const data = await getBootstrapConfig()
 
       platform.value = data.platform || ''
       filterTabsByPlatform(platform.value)

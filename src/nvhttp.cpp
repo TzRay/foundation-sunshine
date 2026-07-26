@@ -10,9 +10,7 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -36,6 +34,7 @@
 #include "config.h"
 #include "confighttp.h"
 #include "display_device/session.h"
+#include "display_device/vdd_capability.h"
 #include "file_handler.h"
 #include "file_mapping/file_mapping_http.h"
 #include "file_mapping/service.h"
@@ -53,13 +52,14 @@
 #include "nvhttp/dynamic_params.h"
 #include "nvhttp/pairing.h"
 #include "nvhttp/sessions.h"
+#include "nvhttp/tls_client_identity_store.h"
 #include "nvhttp_stream_start.h"
 #include "platform/common.h"
 #include "platform/run_command.h"
 #include "process.h"
 #include "rtsp.h"
 #include "stream.h"
-#include "system_tray.h"
+#include "tray/system_tray.h"
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
@@ -81,10 +81,22 @@ namespace nvhttp {
 
   std::atomic<uint32_t> session_id_counter;
 
-  // Map to store certificate UUIDs keyed by request pointer
-  // Using weak_ptr to track request lifetime and prevent memory leaks
-  static std::map<const void *, std::pair<std::weak_ptr<void>, std::string>> request_cert_uuid_map;
-  static std::mutex request_cert_uuid_map_mutex;
+  static tls_client_identity_store_t tls_client_identities;
+
+  template <class Request>
+  std::string
+  get_tls_connection_key(const std::shared_ptr<Request> &request) {
+    const auto remote = request->remote_endpoint();
+    const auto local = request->local_endpoint();
+    if (remote.port() == 0 || local.port() == 0) {
+      return {};
+    }
+
+    std::ostringstream key;
+    key << '[' << remote.address().to_string() << "]:" << remote.port()
+        << ">[" << local.address().to_string() << "]:" << local.port();
+    return key.str();
+  }
 
   class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
   public:
@@ -154,26 +166,15 @@ namespace nvhttp {
 #endif
                   };
                   if (x509) {
-                    std::string client_cert_pem = crypto::pem(x509);
-                    if (auto uuid = pairing::client_uuid_for_cert(client_cert_pem); !uuid.empty()) {
-                      // Store UUID in map using request pointer as key.
-                      // Opportunistically sweep expired entries on every
-                      // insert so that requests which never reach
-                      // get_client_cert_uuid_from_request() (e.g. serverinfo
-                      // polling, applist) and never trigger on_error don't
-                      // accumulate forever. This bounds the map size at
-                      // ~(live requests + recently completed requests).
-                      std::lock_guard<std::mutex> lock(request_cert_uuid_map_mutex);
-                      for (auto it = request_cert_uuid_map.begin(); it != request_cert_uuid_map.end();) {
-                        if (it->second.first.expired()) {
-                          it = request_cert_uuid_map.erase(it);
-                        }
-                        else {
-                          ++it;
-                        }
-                      }
-                      request_cert_uuid_map[session->request.get()] =
-                        std::make_pair(std::weak_ptr<void>(std::static_pointer_cast<void>(session->request)), std::move(uuid));
+                    if (auto uuid = pairing::client_uuid_for_cert(x509.get()); !uuid.empty()) {
+                      // Client authentication belongs to the TLS connection,
+                      // not to the first HTTP Request object created for it.
+                      // Simple-Web-Server replaces Request objects between
+                      // keep-alive requests while retaining the connection.
+                      tls_client_identities.remember(
+                        get_tls_connection_key(session->request),
+                        std::weak_ptr<void>(std::static_pointer_cast<void>(session->connection)),
+                        std::move(uuid));
                     }
                   }
                 }
@@ -206,27 +207,11 @@ namespace nvhttp {
   using resp_http_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response>;
   using req_http_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Request>;
 
-  // Get client certificate UUID from request
+  // Get the client certificate UUID authenticated on this request's TLS connection.
   std::string
   get_client_cert_uuid_from_request(req_https_t request) {
     try {
-      // Retrieve UUID from map using request pointer as key
-      std::lock_guard<std::mutex> lock(request_cert_uuid_map_mutex);
-      auto it = request_cert_uuid_map.find(request.get());
-      if (it != request_cert_uuid_map.end()) {
-        // Check if request is still valid (not expired)
-        if (!it->second.first.expired()) {
-          std::string uuid = it->second.second;
-          // Clean up after retrieval to prevent memory leaks
-          // (assuming UUID is only needed once per request)
-          request_cert_uuid_map.erase(it);
-          return uuid;
-        }
-        else {
-          // Request expired, remove from map
-          request_cert_uuid_map.erase(it);
-        }
-      }
+      return tls_client_identities.lookup(get_tls_connection_key(request));
     }
     catch (const std::exception &e) {
       BOOST_LOG(debug) << "Failed to get client certificate UUID: " << e.what();
@@ -343,6 +328,27 @@ namespace nvhttp {
     }
 
     return launch_session;
+  }
+
+  bool
+  register_launch_ticket(pt::ptree &tree,
+                         const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
+                         std::string_view result_node) {
+    const auto result = rtsp_stream::launch_session_raise(launch_session);
+    if (result == rtsp_stream::launch_ticket_register_e::accepted ||
+        result == rtsp_stream::launch_ticket_register_e::replaced) {
+      return true;
+    }
+
+    const auto busy = result == rtsp_stream::launch_ticket_register_e::client_busy;
+    tree.put("root.<xmlattr>.status_code", busy ? 409 : 503);
+    tree.put("root.<xmlattr>.status_message",
+             busy ? "A streaming handshake is already in progress for this client" :
+                    "The host has no capacity for another pending streaming handshake");
+    tree.put(std::string { "root." } + std::string { result_node }, 0);
+    BOOST_LOG(warning) << "Unable to register RTSP launch ticket for client "sv
+                       << launch_session->client_name << ": result="sv << static_cast<int>(result);
+    return false;
   }
 
   template <class T>
@@ -528,6 +534,12 @@ namespace nvhttp {
     // AI capability: inform client if AI proxy is available
     tree.put("root.AiCapability", confighttp::isAiEnabled() ? 1 : 0);
 
+#ifdef _WIN32
+    tree.put("root.VddCapabilityVersion", display_device::vdd_capability::capability_version);
+#else
+    tree.put("root.VddCapabilityVersion", 0);
+#endif
+
     std::ostringstream data;
 
     pt::write_xml(data, tree);
@@ -594,10 +606,12 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     const auto launch_session = make_launch_session(host_audio, args);
+    launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
 
     // Store the stable client certificate UUID in the launch environment.
     std::string client_cert_uuid = get_client_cert_uuid_from_request(request);
     if (!client_cert_uuid.empty()) {
+      launch_session->client_cert_uuid = client_cert_uuid;
       launch_session->env["SUNSHINE_CLIENT_CERT_UUID"] = client_cert_uuid;
     }
 
@@ -637,13 +651,20 @@ namespace nvhttp {
       }
     }
 
+    if (!register_launch_ticket(tree, launch_session, "gamesession")) {
+      // The application was started solely for this launch request. Roll it
+      // back if the bounded ticket registry cannot publish the handshake.
+      if (appid > 0 && proc::proc.running() == appid) {
+        proc::proc.terminate();
+      }
+      return;
+    }
+
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put("root.sessionUrl0", launch_session->rtsp_url_scheme +
                                    net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
                                    std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
     tree.put("root.gamesession", 1);
-
-    rtsp_stream::launch_session_raise(launch_session);
 
     // Send webhook notification for successful launch
     webhook::send_event_async(webhook::event_t {
@@ -678,6 +699,7 @@ namespace nvhttp {
     }
 
     pt::ptree tree;
+    bool need_to_restore_display_state { false };
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -688,6 +710,10 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+
+      if (need_to_restore_display_state) {
+        display_device::session_t::get().restore_state();
+      }
     });
 
     auto current_appid = proc::proc.running();
@@ -726,31 +752,37 @@ namespace nvhttp {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
     const auto launch_session = make_launch_session(host_audio, args);
+    launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
 
     // Get client certificate UUID (stable client identifier) and store it in env
     std::string client_cert_uuid = get_client_cert_uuid_from_request(request);
     if (!client_cert_uuid.empty()) {
+      launch_session->client_cert_uuid = client_cert_uuid;
       launch_session->env["SUNSHINE_CLIENT_CERT_UUID"] = client_cert_uuid;
     }
 
     if (no_active_sessions) {
-      // We want to prepare display only if there are no active sessions at
-      // the moment. This should be done before probing encoders as it could
-      // change the active displays.
+      // Prepare before publishing the ticket so the handshake expiration
+      // window starts only when the host is ready to accept RTSP.
       if (!stream_start::prepare_display_and_probe_encoders(tree, *launch_session, false)) {
         tree.put("root.resume", 0);
-
         return;
       }
+      need_to_restore_display_state = true;
     }
+
     auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
     if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
+      tree.put("root.resume", 0);
 
+      return;
+    }
+
+    if (!register_launch_ticket(tree, launch_session, "resume")) {
       return;
     }
 
@@ -759,8 +791,7 @@ namespace nvhttp {
                                    net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
                                    std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
     tree.put("root.resume", 1);
-
-    rtsp_stream::launch_session_raise(launch_session);
+    need_to_restore_display_state = false;
 
     // Send webhook notification for successful resume
     webhook::send_event_async(webhook::event_t {
@@ -794,17 +825,30 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
+    const auto client_cert_uuid = get_client_cert_uuid_from_request(request);
+    if (client_cert_uuid.empty()) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "Unable to identify the authenticated client");
+      return;
+    }
+
+    const auto result = rtsp_stream::cancel_client_sessions(client_cert_uuid);
+    BOOST_LOG(info) << "Client-scoped cancel [client_uuid="sv << client_cert_uuid
+                    << ", cancelled="sv << result.cancelled_sessions
+                    << ", remaining="sv << result.remaining_sessions << ']';
+
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
-    rtsp_stream::terminate_sessions();
+    if (result.remaining_sessions == 0) {
+      if (proc::proc.running() > 0) {
+        proc::proc.terminate();
+      }
 
-    if (proc::proc.running() > 0) {
-      proc::proc.terminate();
+      // Preserve the legacy single-client behavior once no other session is using the host.
+      display_device::session_t::get().restore_state();
     }
-
-    // The state needs to be restored regardless of whether "proc::proc.terminate()" was called or not.
-    display_device::session_t::get().restore_state();
   }
 
   void
@@ -1021,20 +1065,10 @@ namespace nvhttp {
     // threads keep the listener responsive under such conditions.
     https_server.config.thread_pool_size = 4;
 
-    // Clean up request_cert_uuid_map entries when a request fails before
-    // get_client_cert_uuid_from_request() is reached, otherwise stale entries
-    // (with expired weak_ptr) accumulate over the lifetime of the process.
+    // A transport error ends the authenticated connection context. Expired
+    // identities for any other connections are pruned opportunistically too.
     https_server.on_error = [](req_https_t request, const SimpleWeb::error_code & /*ec*/) {
-      std::lock_guard<std::mutex> lock(request_cert_uuid_map_mutex);
-      request_cert_uuid_map.erase(request.get());
-      // Opportunistic sweep of any other entries whose request has gone away.
-      for (auto it = request_cert_uuid_map.begin(); it != request_cert_uuid_map.end();) {
-        if (it->second.first.expired()) {
-          it = request_cert_uuid_map.erase(it);
-        } else {
-          ++it;
-        }
-      }
+      tls_client_identities.forget(get_tls_connection_key(request));
     };
 
     http_server.default_resource["GET"] = not_found<SimpleWeb::HTTP>;

@@ -1,5 +1,5 @@
 /**
- * @file src/system_tray.cpp
+ * @file src/tray/system_tray.cpp
  * @brief Definitions for the system tray icon and notification system.
  */
 // macros
@@ -9,10 +9,8 @@
     #define WIN32_LEAN_AND_MEAN
     #include <accctrl.h>
     #include <aclapi.h>
-    #include <commdlg.h>  // 添加文件对话框支持
-    #include <shellapi.h>  // 添加 ShellExecuteW 函数声明
-    #include <shlobj.h>  // 添加 SHGetFolderPathW 函数声明
-    #include <shobjidl.h>  // 添加 IFileDialog COM接口声明
+    #include <shlobj.h>
+    #include <shobjidl.h>
     #include <tlhelp32.h>
     #include <windows.h>
     #define TRAY_ICON WEB_DIR "images/sunshine.ico"
@@ -35,30 +33,30 @@
   // standard includes
   #include <atomic>
   #include <chrono>
-  #include <csignal>
   #include <ctime>
+  #include <filesystem>
   #include <fstream>
-  #include <future>
+  #include <mutex>
   #include <string>
   #include <thread>
 
   // lib includes
   #include "tray/src/tray.h"
-  #include <boost/filesystem.hpp>
-  #include <boost/process/v1/environment.hpp>
 
   // local includes
-  #include "confighttp.h"
-  #include "display_device/session.h"
-  #include "file_handler.h"
-  #include "logging.h"
-  #include "platform/common.h"
-  #include "platform/windows/misc.h"
-  #include "process.h"
+  #include "src/confighttp.h"
+  #include "src/display_device/session.h"
+  #include "src/display_device/vdd_utils.h"
+  #include "src/file_handler.h"
+  #include "src/logging.h"
+  #include "src/platform/common.h"
+  #include "src/platform/windows/misc.h"
+  #include "src/process.h"
   #include "src/display_device/display_device.h"
   #include "src/entry_handler.h"
   #include "src/globals.h"
   #include "system_tray_i18n.h"
+  #include "tray_state.h"
   #include "version.h"
 
 using namespace std::literals;
@@ -72,10 +70,19 @@ namespace system_tray {
   static std::atomic tray_thread_running = false;
   static std::atomic tray_thread_should_exit = false;
   static std::atomic<bool> end_tray_called = false;
+  static std::mutex tray_lifecycle_mutex;
 
   // 前向声明全局变量
   extern struct tray_menu tray_menus[];
   extern struct tray tray;
+  static void
+  tray_thread_worker();
+#ifdef _WIN32
+  static int
+  start_tray_instance_locked();
+  static void
+  stop_tray_instance_locked();
+#endif
 
   // 静态字符串变量用于存储本地化的菜单文本
   // 这些变量必须是静态的，以确保在 tray_menus 的生命周期内有效
@@ -205,10 +212,32 @@ namespace system_tray {
     return !vdd_device_id.empty();
   }
 
+  static bool ensure_vdd_prerequisite() {
+    const auto status = display_device::vdd_utils::get_vdd_status();
+    const auto prerequisite = display_device::vdd_utils::classify_vdd_prerequisite(status);
+    if (prerequisite == display_device::vdd_utils::vdd_prerequisite_e::usable) {
+      return true;
+    }
+
+    BOOST_LOG(warning) << (prerequisite == display_device::vdd_utils::vdd_prerequisite_e::unavailable ?
+                            "VDD_DRIVER_UNAVAILABLE" : "VDD_DRIVER_NOT_INSTALLED")
+                       << ": tray VDD action redirected to the Sunshine UI"sv;
+#ifdef _WIN32
+    const auto title = system_tray_i18n::utf8_to_wstring(
+      system_tray_i18n::get_localized_string(system_tray_i18n::KEY_VDD_PREREQUISITE_TITLE));
+    const auto message = system_tray_i18n::utf8_to_wstring(
+      system_tray_i18n::get_localized_string(system_tray_i18n::KEY_VDD_PREREQUISITE_MSG));
+    MessageBoxW(nullptr, message.c_str(), title.c_str(), MB_OK | MB_ICONWARNING);
+#endif
+    launch_ui();
+    return false;
+  }
+
   // 更新 VDD 菜单项的文本和状态
   static void update_vdd_menu_text() {
     bool vdd_active = is_vdd_active();
     bool keep_enabled = config::video.vdd_keep_enabled;
+    tray_state::set_vdd_state(vdd_active, keep_enabled, config::video.vdd_headless_create_enabled, s_vdd_in_cooldown);
     
     // 1. 创建项：启用即勾选，启用后或冷却中禁止点击
     vdd_submenu[0].checked = vdd_active ? 1 : 0;
@@ -243,6 +272,7 @@ namespace system_tray {
   auto tray_vdd_create_cb = [](struct tray_menu *item) {
     if (!tray_initialized) return;
     if (s_vdd_in_cooldown || is_vdd_active()) return;
+    if (!ensure_vdd_prerequisite()) return;
 
     BOOST_LOG(info) << "Creating VDD from system tray (Separate Item)"sv;
     if (display_device::session_t::get().toggle_display_power()) {
@@ -267,6 +297,7 @@ namespace system_tray {
     bool is_persistent = config::video.vdd_keep_enabled;
     
     if (!is_persistent) {
+      if (!ensure_vdd_prerequisite()) return;
       // 启用保持启用模式前弹出确认
 #ifdef _WIN32
       std::wstring title = system_tray_i18n::utf8_to_wstring(system_tray_i18n::get_localized_string(system_tray_i18n::KEY_VDD_PERSISTENT_CONFIRM_TITLE));
@@ -296,6 +327,7 @@ namespace system_tray {
   auto tray_vdd_headless_create_cb = [](struct tray_menu *item) {
     BOOST_LOG(info) << "Toggling headless VDD create from system tray"sv;
     if (!config::video.vdd_headless_create_enabled) {
+      if (!ensure_vdd_prerequisite()) return;
       // 启用前二次确认
 #ifdef _WIN32
       std::wstring title = system_tray_i18n::utf8_to_wstring(system_tray_i18n::get_localized_string(system_tray_i18n::KEY_VDD_HEADLESS_CREATE_CONFIRM_TITLE));
@@ -1162,6 +1194,9 @@ namespace system_tray {
     // Wait for the shell to be initialized before registering the tray icon.
     // This ensures the tray icon works reliably after a logoff/logon cycle.
     while (GetShellWindow() == nullptr) {
+      if (tray_thread_should_exit) {
+        return 1;
+      }
       Sleep(1000);
     }
   #endif
@@ -1228,21 +1263,25 @@ namespace system_tray {
       return 0;
     }
 
+#ifdef _WIN32
+    {
+      std::lock_guard lock { tray_lifecycle_mutex };
+      try {
+        stop_tray_instance_locked();
+      }
+      catch (const std::system_error &e) {
+        BOOST_LOG(warning) << "Failed to stop tray thread: " << e.what();
+      }
+    }
+#else
     if (!tray_initialized) {
       return 0;
     }
 
     tray_initialized = false;
     tray_exit();
+#endif
 
-    if (tray_thread.joinable()) {
-      try {
-        tray_thread.join();
-      }
-      catch (const std::system_error &e) {
-        BOOST_LOG(warning) << "Failed to join tray thread: " << e.what();
-      }
-    }
     return 0;
   }
 
@@ -1402,14 +1441,73 @@ namespace system_tray {
     tray_update(&tray);
   }
 
+#ifdef _WIN32
+  static void
+  stop_tray_instance_locked() {
+    tray_thread_should_exit = true;
+
+    for (int attempts = 0; tray_thread_running && !tray_initialized && attempts < 50; ++attempts) {
+      std::this_thread::sleep_for(20ms);
+    }
+
+    if (tray_initialized.exchange(false)) {
+      tray_exit();
+    }
+
+    if (tray_thread.joinable()) {
+      tray_thread.join();
+    }
+  }
+
+  static int
+  start_tray_instance_locked() {
+    if (tray_initialized) {
+      return 0;
+    }
+
+    if (tray_thread.joinable()) {
+      tray_thread.join();
+    }
+
+    try {
+      tray_thread_should_exit = false;
+      tray_thread = std::thread(tray_thread_worker);
+
+      BOOST_LOG(info) << "System tray thread initialized successfully"sv;
+      return 0;
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(error) << "Failed to create tray thread: " << e.what();
+      return 1;
+    }
+  }
+
+#endif
+
   // Threading functions available on all platforms
   static void
   tray_thread_worker() {
+    tray_thread_running = true;
     BOOST_LOG(info) << "System tray thread started"sv;
 
     // Initialize the tray in this thread
     if (init_tray() != 0) {
-      BOOST_LOG(error) << "Failed to initialize tray in thread"sv;
+      if (tray_thread_should_exit) {
+        BOOST_LOG(debug) << "System tray initialization cancelled"sv;
+      }
+      else {
+        BOOST_LOG(error) << "Failed to initialize tray in thread"sv;
+      }
+      tray_thread_running = false;
+      return;
+    }
+
+    if (tray_thread_should_exit) {
+      if (tray_initialized.exchange(false)) {
+        tray_exit();
+      }
+      tray_thread_running = false;
+      BOOST_LOG(info) << "System tray thread stopped before entering event loop"sv;
       return;
     }
 
@@ -1417,6 +1515,7 @@ namespace system_tray {
     while (process_tray_events() == 0);
 
     BOOST_LOG(info) << "System tray thread ended"sv;
+    tray_thread_running = false;
   }
 
   int
@@ -1424,10 +1523,10 @@ namespace system_tray {
     // Reset the end_tray flag for new tray instance
     end_tray_called = false;
 
-    if (tray_thread.joinable()) {
-      tray_thread.join();
-    }
-
+#ifdef _WIN32
+    std::lock_guard lock { tray_lifecycle_mutex };
+    return start_tray_instance_locked();
+#else
     try {
       tray_thread = std::thread(tray_thread_worker);
 
@@ -1438,6 +1537,7 @@ namespace system_tray {
       BOOST_LOG(error) << "Failed to create tray thread: " << e.what();
       return 1;
     }
+#endif
   }
 
 }  // namespace system_tray

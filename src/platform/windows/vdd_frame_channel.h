@@ -95,6 +95,7 @@ namespace platf::dxgi::vdd_frame_channel {
     caps_unsupported,
     caps_failed,
     open_unsupported,
+    open_not_ready,
     open_failed,
     attach_failed,
     sealed_required_failed,
@@ -109,6 +110,28 @@ namespace platf::dxgi::vdd_frame_channel {
       return ok;
     }
   };
+
+  enum class producer_match {
+    unavailable,
+    exact,
+    sole_mismatch,
+  };
+
+  struct producer_selection {
+    int index = -1;
+    producer_match match = producer_match::unavailable;
+  };
+
+  inline producer_selection
+  select_producer(int exact_index, int only_valid_index, unsigned int valid_count) {
+    if (exact_index >= 0) {
+      return {exact_index, producer_match::exact};
+    }
+    if (valid_count == 1 && only_valid_index >= 0) {
+      return {only_valid_index, producer_match::sole_mismatch};
+    }
+    return {};
+  }
 
   inline bool
   luid_equal(const LUID &a, const LUID &b) {
@@ -175,6 +198,8 @@ namespace platf::dxgi::vdd_frame_channel {
         return "caps_failed";
       case channel_selection::open_unsupported:
         return "open_unsupported";
+      case channel_selection::open_not_ready:
+        return "open_not_ready";
       case channel_selection::open_failed:
         return "open_failed";
       case channel_selection::attach_failed:

@@ -29,39 +29,33 @@ env:
 
 jobs:
   setup_release:
-    name: Setup Release
+    name: Setup Build Metadata
     outputs:
-      publish_release: ${{ steps.setup_release_auto.outputs.publish_release || steps.setup_release_manual.outputs.publish_release }}
-      release_body: ${{ steps.setup_release_auto.outputs.release_body || steps.setup_release_manual.outputs.release_body }}
-      release_commit: ${{ steps.setup_release_auto.outputs.release_commit || steps.setup_release_manual.outputs.release_commit }}
-      release_generate_release_notes: ${{ steps.setup_release_auto.outputs.release_generate_release_notes || steps.setup_release_manual.outputs.release_generate_release_notes }}
-      release_tag: ${{ steps.setup_release_auto.outputs.release_tag || steps.setup_release_manual.outputs.release_tag }}
-      release_version: ${{ steps.setup_release_auto.outputs.release_version || steps.setup_release_manual.outputs.release_version }}
+      publish_release: ${{ steps.setup_build.outputs.publish_release }}
+      release_body: ${{ steps.setup_build.outputs.release_body }}
+      release_commit: ${{ steps.setup_build.outputs.release_commit }}
+      release_generate_release_notes: ${{ steps.setup_build.outputs.release_generate_release_notes }}
+      release_tag: ${{ steps.setup_build.outputs.release_tag }}
+      release_version: ${{ steps.setup_build.outputs.release_version }}
     permissions:
-      contents: write  # read does not work to check squash and merge details
+      contents: read
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Release (Auto)
-        id: setup_release_auto
-        if: github.event_name != 'workflow_dispatch'
-        uses: LizardByte/setup-release-action@v2025.426.225
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup Release (Manual)
-        id: setup_release_manual
-        if: github.event_name == 'workflow_dispatch'
+      - name: 生成构建元数据
+        id: setup_build
+        shell: bash
         run: |
           SUFFIX=$([ "${{ github.ref_name }}" = "master" ] && echo "" || echo "-dev")
+          BUILD_KIND=$([ "${{ github.event_name }}" = "workflow_dispatch" ] && echo "manual" || echo "ci")
+          BUILD_TAG="${BUILD_KIND}-$(date +%Y%m%d-%H%M%S)-${{ github.run_number }}${SUFFIX}"
+
+          echo "正在生成独立于上游仓库合并策略的构建元数据。"
           echo "publish_release=false" >> $GITHUB_OUTPUT
-          echo "release_body=Manual build (${{ github.ref_name }})" >> $GITHUB_OUTPUT
+          echo "release_body=流水线构建 (${{ github.ref_name }})" >> $GITHUB_OUTPUT
           echo "release_commit=${{ github.sha }}" >> $GITHUB_OUTPUT
           echo "release_generate_release_notes=false" >> $GITHUB_OUTPUT
-          echo "release_tag=manual-$(date +%Y%m%d-%H%M%S)${SUFFIX}" >> $GITHUB_OUTPUT
-          echo "release_version=manual-$(date +%Y%m%d-%H%M%S)${SUFFIX}" >> $GITHUB_OUTPUT
+          echo "release_tag=${BUILD_TAG}" >> $GITHUB_OUTPUT
+          echo "release_version=${BUILD_TAG}" >> $GITHUB_OUTPUT
 
   build_win:
     name: Windows

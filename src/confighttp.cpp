@@ -8,6 +8,9 @@
 
 #include "process.h"
 
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -22,6 +25,7 @@
 #include <cstdio>
 #include <ctime>
 #include <thread>
+#include <utility>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
@@ -40,11 +44,14 @@
 #include "config.h"
 #include "confighttp.h"
 #include "clipboard_http.h"
+#include "ai/credential_store.h"
 #include "crypto.h"
+#include "display_device/color_profile.h"
 #include "display_device/session.h"
 #include "file_mapping/file_mapping_store.h"
 #include "file_handler.h"
 #include "globals.h"
+#include "hdr/client_display_capabilities.h"
 #include "http_util.h"
 #include "httpcommon.h"
 #include "logging.h"
@@ -61,11 +68,15 @@
 #include "uuid.h"
 #include "video.h"
 #include "version.h"
-#include "webhook.h"
+#include "webhook/webhook.h"
+#include "webhook/webhook_api.h"
 
 #ifdef _WIN32
+  #include "ds5/config_api.h"
   #include <iphlpapi.h>
   #include "display_device/vdd_utils.h"
+  #include "platform/windows/display_device/color_profile.h"
+  #include "platform/windows/mic_write.h"
   #include "platform/windows/vulkan_hdr_bridge_session.h"
 #endif
 
@@ -388,6 +399,18 @@ namespace confighttp {
   void
   getSunshineLogoImage(resp_https_t response, req_https_t request) {
     getStaticResource(response, request, WEB_DIR "images/logo-sunshine-256.png", "image/png");
+  }
+
+  void
+  getAlkaidLabLogoImage(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    getStaticResource(response, request, WEB_DIR "images/logo-alkaidlab.png", "image/png");
+  }
+
+  void
+  getNatPierceLogoImage(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    getStaticResource(response, request, WEB_DIR "images/logo-natpierce.png", "image/png");
   }
 
   /**
@@ -805,6 +828,26 @@ namespace confighttp {
       auto &input_apps_node = inputTree.get_child("apps"s);
       auto &input_edit_node = inputTree.get_child("editApp"s);
 
+      const auto normalize_gamepad = [&](pt::ptree &app_node) {
+        auto gamepad = app_node.get_optional<std::string>("gamepad");
+        if (gamepad && gamepad->empty()) {
+          app_node.erase("gamepad");
+        }
+        else if (gamepad && *gamepad != "auto"sv && *gamepad != "x360"sv && *gamepad != "ds4"sv && *gamepad != "ds5"sv) {
+          outputTree.put("status", "false");
+          outputTree.put("error", "Invalid per-app gamepad type");
+          return false;
+        }
+
+        return true;
+      };
+
+      for (auto &[_, app_node] : input_apps_node) {
+        if (!normalize_gamepad(app_node)) {
+          return;
+        }
+      }
+
       // Validate app name when editing a specific app
       if (!input_edit_node.empty()) {
         auto app_name = input_edit_node.get<std::string>("name", "");
@@ -828,6 +871,10 @@ namespace confighttp {
         auto detached = input_edit_node.get_child_optional("detached");
         if (detached && detached->empty()) {
           input_edit_node.erase("detached");
+        }
+
+        if (!normalize_gamepad(input_edit_node)) {
+          return;
         }
 
         int index = input_edit_node.get<int>("index");
@@ -1399,7 +1446,11 @@ namespace confighttp {
       }
 
       // 更新配置
-      config::update_full_config(fullConfig);
+      if (!config::update_full_config(fullConfig)) {
+        outputTree.put("status", "false");
+        outputTree.put("error", "failed to persist configuration");
+        return;
+      }
     }
     catch (std::exception &e) {
       BOOST_LOG(warning) << "SaveConfig: "sv << e.what();
@@ -1410,6 +1461,162 @@ namespace confighttp {
 
     outputTree.put("status", "true");
   }
+
+  void
+  saveClients(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request)) return;
+
+    print_req(request);
+
+    nlohmann::json output {
+      {"status", false},
+    };
+
+    try {
+      std::stringstream body;
+      body << request->content.rdbuf();
+      const auto input = nlohmann::json::parse(body.str());
+      if (!input.is_object()) {
+        throw std::invalid_argument("clients must be a serialized JSON array");
+      }
+      const auto clients_it = input.find("clients");
+      if (clients_it == input.end() || !clients_it->is_string()) {
+        throw std::invalid_argument("clients must be a serialized JSON array");
+      }
+
+      const auto serialized_clients = clients_it->get<std::string>();
+      constexpr std::size_t max_clients_config_size { 1024 * 1024 };
+      if (serialized_clients.size() > max_clients_config_size) {
+        throw std::invalid_argument("clients configuration is too large");
+      }
+
+      const auto clients = nlohmann::json::parse(serialized_clients);
+      if (!clients.is_array()) {
+        throw std::invalid_argument("clients must contain a JSON array");
+      }
+      if (clients.size() > 1024) {
+        throw std::invalid_argument("too many client settings");
+      }
+
+      std::set<std::string> uuids;
+      for (const auto &client : clients) {
+        if (!client.is_object()) {
+          throw std::invalid_argument("each client setting must be an object");
+        }
+
+        if (const auto uuid_it = client.find("uuid"); uuid_it != client.end()) {
+          if (!uuid_it->is_string() || uuid_it->get_ref<const std::string &>().size() > 128) {
+            throw std::invalid_argument("client uuid must be a string of at most 128 bytes");
+          }
+          const auto &uuid = uuid_it->get_ref<const std::string &>();
+          if (!uuid.empty() && !uuids.insert(uuid).second) {
+            throw std::invalid_argument("client uuid must be unique");
+          }
+        }
+
+        if (const auto name_it = client.find("name"); name_it != client.end() &&
+            (!name_it->is_string() || name_it->get_ref<const std::string &>().size() > 256)) {
+          throw std::invalid_argument("client name must be a string of at most 256 bytes");
+        }
+
+        if (const auto profile_it = client.find("hdrProfile"); profile_it != client.end()) {
+          if (!profile_it->is_string()) {
+            throw std::invalid_argument("HDR profile must be a string");
+          }
+          const auto &profile = profile_it->get_ref<const std::string &>();
+          if (!profile.empty() && !display_device::color_profile::is_valid_profile_basename(profile)) {
+            throw std::invalid_argument("HDR profile must be an installed .icc or .icm filename");
+          }
+        }
+
+        const auto brightness_mode = client.value("hdrBrightnessMode", "auto");
+        if (brightness_mode != "auto" && brightness_mode != "manual") {
+          throw std::invalid_argument("HDR brightness mode must be auto or manual");
+        }
+        if (brightness_mode == "manual") {
+          const auto read_brightness = [&](const char *field) -> float {
+            const auto value = client.find(field);
+            if (value == client.end() || !value->is_number()) {
+              throw std::invalid_argument(std::string { "manual HDR brightness requires numeric " } + field);
+            }
+            const float number = value->get<float>();
+            if (!std::isfinite(number)) {
+              throw std::invalid_argument(std::string { field } + " must be finite");
+            }
+            return number;
+          };
+
+          const auto validated = hdr::validate_client_display_capabilities(
+            read_brightness("hdrBrightnessMaxNits"),
+            read_brightness("hdrBrightnessMinNits"),
+            read_brightness("hdrBrightnessMaxFullFrameNits"));
+          if (!validated.capabilities.reported) {
+            throw std::invalid_argument(validated.fallback_reason);
+          }
+        }
+      }
+
+      if (!config::save_clients_config(serialized_clients)) {
+        output["error"] = "failed to persist client settings";
+      }
+      else {
+        output["status"] = true;
+      }
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(warning) << "SaveClients: "sv << e.what();
+      output["error"] = e.what();
+    }
+
+    send_response(response, output);
+  }
+
+  void
+  getWebhookConfig(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    webhook::api::get_config(std::move(response), config::sunshine.config_file);
+  }
+
+  void
+  saveWebhookConfig(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request)) return;
+
+    webhook::api::save_config(
+      std::move(response),
+      std::move(request),
+      config::sunshine.config_file
+    );
+  }
+
+  void
+  testWebhook(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request)) return;
+
+    webhook::api::test_delivery(std::move(response), std::move(request));
+  }
+
+#ifdef _WIN32
+  void
+  getDualSenseConfig(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    ds5_config::api::get_config(std::move(response), config::sunshine.config_file);
+  }
+
+  void
+  saveDualSenseConfig(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request)) return;
+    ds5_config::api::save_config(
+      std::move(response),
+      std::move(request),
+      config::sunshine.config_file
+    );
+  }
+#endif
 
   void
   restart(resp_https_t response, req_https_t request) {
@@ -1448,6 +1655,24 @@ namespace confighttp {
 
     display_device::session_t::get().reset_persistence();
     outputTree.put("status", true);
+  }
+
+  void
+  testMicrophone(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+#ifdef _WIN32
+    const auto result = platf::audio::test_mic_redirect();
+    send_response(response, nlohmann::json {
+      {"success", result.success},
+      {"error_code", result.error_code},
+    });
+#else
+    send_response(response, nlohmann::json {
+      {"success", false},
+      {"error_code", "MIC_TEST_UNSUPPORTED"},
+    });
+#endif
   }
 
 #ifdef _WIN32
@@ -1606,38 +1831,36 @@ namespace confighttp {
       bool pin_result = nvhttp::pin(pin, name);
       outputTree.put("status", pin_result);
 
-      // Send webhook notification
-      webhook::send_event_async(webhook::event_t{
-        .type = pin_result ? webhook::event_type_t::CONFIG_PIN_SUCCESS : webhook::event_type_t::CONFIG_PIN_FAILED,
-        .alert_type = pin_result ? "config_pair_success" : "config_pair_failed",
-        .timestamp = webhook::get_current_timestamp(),
-        .client_name = name,
-        .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
-        .server_ip = net::addr_to_normalized_string(request->local_endpoint().address()),
-        .app_name = "",
-        .app_id = 0,
-        .session_id = "",
-        .extra_data = {}
-      });
+      try {
+        webhook::send_event_async(webhook::event_t{
+          .type = pin_result ? webhook::event_type_t::CONFIG_PIN_SUCCESS : webhook::event_type_t::CONFIG_PIN_FAILED,
+          .timestamp = webhook::get_current_timestamp(),
+          .client_name = name,
+          .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
+          .server_ip = net::addr_to_normalized_string(request->local_endpoint().address())
+        });
+      }
+      catch (...) {
+        BOOST_LOG(error) << "Webhook pairing event construction failed"sv;
+      }
     }
     catch (std::exception &e) {
       BOOST_LOG(warning) << "SavePin: "sv << e.what();
       outputTree.put("status", false);
       outputTree.put("error", e.what());
 
-      // Send webhook notification for pairing failure
-      webhook::send_event_async(webhook::event_t{
-        .type = webhook::event_type_t::CONFIG_PIN_FAILED,
-        .alert_type = "config_pair_failed",
-        .timestamp = webhook::get_current_timestamp(),
-        .client_name = "",
-        .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
-        .server_ip = net::addr_to_normalized_string(request->local_endpoint().address()),
-        .app_name = "",
-        .app_id = 0,
-        .session_id = "",
-        .extra_data = {{"error", e.what()}}
-      });
+      try {
+        webhook::send_event_async(webhook::event_t{
+          .type = webhook::event_type_t::CONFIG_PIN_FAILED,
+          .timestamp = webhook::get_current_timestamp(),
+          .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
+          .server_ip = net::addr_to_normalized_string(request->local_endpoint().address()),
+          .extra_data = {{"error", "invalid_request"}}
+        });
+      }
+      catch (...) {
+        BOOST_LOG(error) << "Webhook pairing failure event construction failed"sv;
+      }
       return;
     }
   }
@@ -1893,11 +2116,88 @@ namespace confighttp {
     if (!authenticate(response, request)) return;
 
     print_req(request);
-    const nlohmann::json named_certs = nvhttp::get_all_clients();
+    nlohmann::json named_certs = nvhttp::get_all_clients();
+    const auto sessions = stream::session::get_all_sessions_info();
+    for (auto &client : named_certs) {
+      if (!client.is_object()) continue;
+      const auto uuid = client.value("uuid", std::string {});
+      const auto name = client.value("name", std::string {});
+      const auto session = std::find_if(sessions.begin(), sessions.end(), [&](const auto &candidate) {
+        return (!uuid.empty() && candidate.client_uuid == uuid) ||
+               (uuid.empty() && !name.empty() && candidate.client_name == name);
+      });
+      if (session == sessions.end()) continue;
+
+      client["hdrBrightnessRuntime"] = {
+        { "active", true },
+        { "reported", session->hdr_brightness_reported },
+        { "source", session->hdr_brightness_source },
+        { "maxNits", session->hdr_max_nits },
+        { "minNits", session->hdr_min_nits },
+        { "maxFullFrameNits", session->hdr_max_full_frame_nits },
+      };
+    }
     nlohmann::json output_tree;
     output_tree["named_certs"] = named_certs;
     output_tree["status"] = "true";
     send_response(response, output_tree);
+  }
+
+  void
+  listColorProfiles(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+#ifdef _WIN32
+    const auto windows_directory = []() -> std::filesystem::path {
+      if (const char *windir = std::getenv("WINDIR"); windir && *windir) {
+        return windir;
+      }
+      return R"(C:\Windows)";
+    }();
+    const auto color_directory = windows_directory / "System32" / "spool" / "drivers" / "color";
+
+    std::error_code error;
+    std::vector<std::string> profiles;
+    std::filesystem::directory_iterator entry { color_directory, std::filesystem::directory_options::skip_permission_denied, error };
+    const std::filesystem::directory_iterator end;
+    while (!error && entry != end) {
+      std::error_code entry_error;
+      if (entry->is_regular_file(entry_error) && !entry_error) {
+        const auto utf8_name = entry->path().filename().u8string();
+        const std::string profile_name {
+          reinterpret_cast<const char *>(utf8_name.data()),
+          utf8_name.size()
+        };
+        if (display_device::color_profile::is_valid_profile_basename(profile_name)) {
+          profiles.push_back(profile_name);
+        }
+      }
+      entry.increment(error);
+    }
+
+    if (error) {
+      send_response(response, nlohmann::json {
+        {"status", false},
+        {"supported", true},
+        {"profiles", nlohmann::json::array()},
+        {"error", "failed to enumerate installed color profiles"},
+      });
+      return;
+    }
+
+    std::sort(profiles.begin(), profiles.end());
+    send_response(response, nlohmann::json {
+      {"status", true},
+      {"supported", true},
+      {"profiles", profiles},
+    });
+#else
+    send_response(response, nlohmann::json {
+      {"status", true},
+      {"supported", false},
+      {"profiles", nlohmann::json::array()},
+    });
+#endif
   }
 
   void
@@ -1971,6 +2271,7 @@ namespace confighttp {
       for (const auto &session_info : sessions_info) {
         json session_obj;
         session_obj["client_name"] = session_info.client_name;
+        session_obj["client_uuid"] = session_info.client_uuid;
         session_obj["client_address"] = session_info.client_address;
         session_obj["state"] = session_info.state;
         session_obj["session_id"] = session_info.session_id;
@@ -1981,6 +2282,12 @@ namespace confighttp {
         session_obj["host_audio"] = session_info.host_audio;
         session_obj["enable_hdr"] = session_info.enable_hdr;
         session_obj["enable_mic"] = session_info.enable_mic;
+        session_obj["use_vdd"] = session_info.use_vdd;
+        session_obj["hdr_brightness_reported"] = session_info.hdr_brightness_reported;
+        session_obj["hdr_brightness_source"] = session_info.hdr_brightness_source;
+        session_obj["hdr_max_nits"] = session_info.hdr_max_nits;
+        session_obj["hdr_min_nits"] = session_info.hdr_min_nits;
+        session_obj["hdr_max_full_frame_nits"] = session_info.hdr_max_full_frame_nits;
         session_obj["app_name"] = session_info.app_name;
         session_obj["app_id"] = session_info.app_id;
         
@@ -2000,6 +2307,128 @@ namespace confighttp {
     }
     catch (...) {
       BOOST_LOG(error) << "getRuntimeSessions: Unknown exception";
+      write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, "Unknown error");
+    }
+  }
+
+  void
+  getRuntimeHdrStatus(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    print_req(request);
+
+    if (!require_localhost(response, request, "getting runtime HDR status")) {
+      return;
+    }
+
+    try {
+      const auto statuses = video::get_hdr_pipeline_statuses();
+      json response_json {
+        { "success", true },
+        { "status_code", 200 },
+        { "status_message", "Success" },
+#ifdef _WIN32
+        { "available", true },
+#else
+        { "available", false },
+#endif
+        { "configured_analysis_mode", config::video.hdr_luminance_analysis },
+        { "configured_conversion_mode", config::video.capture_compute_shader },
+        { "pipelines", json::array() },
+      };
+
+      for (const auto &status : statuses) {
+        response_json["pipelines"].push_back({
+          { "id", status.id },
+          { "hdr_mode", status.hdr_mode },
+          { "analysis_mode", status.analysis_mode },
+          { "analysis_active", status.analysis_active },
+          { "scene_metadata_active", status.scene_metadata_active },
+          { "metadata_formats", status.metadata_formats },
+          { "conversion_path", status.conversion_path },
+          { "conversion_fallback_reason", status.conversion_fallback_reason },
+          { "analysis_failure_reason", status.analysis_failure_reason },
+        });
+      }
+
+      response->write(response_json.dump());
+      response->close_connection_after_response = true;
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(error) << "getRuntimeHdrStatus: " << e.what();
+      write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, std::string(e.what()));
+    }
+    catch (...) {
+      BOOST_LOG(error) << "getRuntimeHdrStatus: Unknown exception";
+      write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, "Unknown error");
+    }
+  }
+
+  void
+  getRuntimeHdrCalibration(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    print_req(request);
+    if (!require_localhost(response, request, "getting HDR calibration status")) return;
+
+    try {
+      json output {
+        { "success", true },
+        { "supported", false },
+        { "vddActive", false },
+        { "hdrEnabled", false },
+        { "calibrated", false },
+        { "profileName", nullptr },
+        { "maxNits", nullptr },
+        { "minNits", nullptr },
+        { "maxFullFrameNits", nullptr },
+        { "state", "unsupported" },
+        { "sharedVdd", config::video.vdd_reuse },
+        { "activeClients", json::array() },
+      };
+
+      for (const auto &session : stream::session::get_all_sessions_info()) {
+        if (session.state == "RUNNING" && session.enable_hdr && session.use_vdd) {
+          output["activeClients"].push_back({
+            { "uuid", session.client_uuid },
+            { "name", session.client_name },
+          });
+        }
+      }
+
+#ifdef _WIN32
+      output["supported"] = true;
+      const auto vdd_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
+      if (!vdd_id.empty()) {
+        output["vddActive"] = true;
+        const auto hdr_states = display_device::get_current_hdr_states({ vdd_id });
+        const auto hdr_state = hdr_states.find(vdd_id);
+        const bool hdr_enabled = hdr_state != hdr_states.end() &&
+                                 hdr_state->second == display_device::hdr_state_e::enabled;
+        output["hdrEnabled"] = hdr_enabled;
+        output["state"] = hdr_enabled ? "ready" : "waiting_hdr";
+
+        if (const auto calibration = display_device::win_color_profile::current_hdr_calibration(vdd_id)) {
+          output["calibrated"] = true;
+          output["profileName"] = calibration->profile_name;
+          output["maxNits"] = calibration->max_nits;
+          output["minNits"] = calibration->min_nits;
+          output["maxFullFrameNits"] = calibration->max_full_frame_nits;
+          output["state"] = "calibrated";
+        }
+      }
+      else {
+        output["state"] = "waiting_vdd";
+      }
+#endif
+
+      send_response(response, output);
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(error) << "getRuntimeHdrCalibration: " << e.what();
+      write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, e.what());
+    }
+    catch (...) {
+      BOOST_LOG(error) << "getRuntimeHdrCalibration: Unknown exception";
       write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, "Unknown error");
     }
   }
@@ -2269,6 +2698,62 @@ namespace confighttp {
     return (config_dir / "ai_config.json").string();
   }
 
+  static fs::path
+  getAiCredentialPath() {
+    auto config_dir = fs::path(config::sunshine.config_file).parent_path();
+    return config_dir / "ai_llm_credential.bin";
+  }
+
+  static void
+  applyStoredCredentialLocked(nlohmann::json &cfg) {
+    auto credential = credential_store::read_llm_api_key(getAiCredentialPath());
+    if (credential.status == credential_store::read_status_e::success) {
+      cfg["apiKey"] = std::move(credential.secret);
+    } else {
+      cfg["apiKey"] = "";
+      if (credential.status == credential_store::read_status_e::error) {
+        BOOST_LOG(error) << "Could not load the LLM API key from secure storage: " << credential.error;
+      }
+    }
+    cfg["apiKeyConfigured"] = !cfg.value("apiKey", "").empty();
+  }
+
+  static bool
+  writeAiConfigFile(const nlohmann::json &cfg) {
+    const fs::path path = getAiConfigPath();
+    auto temp = path;
+    temp += ".tmp";
+    try {
+      {
+        std::ofstream file(temp, std::ios::trunc);
+        if (!file.is_open()) return false;
+        file << cfg.dump(2);
+        file.flush();
+        if (!file.good()) throw std::runtime_error("Failed to flush AI config");
+      }
+#ifdef _WIN32
+      if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::error_code ignored;
+        fs::remove(temp, ignored);
+        return false;
+      }
+#else
+      std::error_code ec;
+      fs::rename(temp, path, ec);
+      if (ec) {
+        fs::remove(temp, ec);
+        return false;
+      }
+#endif
+      return true;
+    } catch (const std::exception &e) {
+      std::error_code ignored;
+      fs::remove(temp, ignored);
+      BOOST_LOG(error) << "Failed to save AI config: " << e.what();
+      return false;
+    }
+  }
+
   /**
    * @brief 从文件或缓存读取 AI 配置（调用方需持有 ai_config_mutex）
    */
@@ -2282,7 +2767,32 @@ namespace confighttp {
     try {
       std::string content = file_handler::read_file(path.c_str());
       if (!content.empty()) {
-        ai_config_cache = nlohmann::json::parse(content);
+        auto persisted = nlohmann::json::parse(content);
+        ai_config_cache = persisted;
+
+        // Migrate legacy plaintext credentials before exposing the runtime
+        // configuration. Never remove the old value until both secure storage
+        // and the sanitized config rewrite have succeeded.
+        const std::string legacy_key = persisted.value("apiKey", "");
+        if (!legacy_key.empty()) {
+          auto migration = credential_store::write_llm_api_key(getAiCredentialPath(), legacy_key);
+          if (migration.success) {
+            auto sanitized = persisted;
+            sanitized.erase("apiKey");
+            if (writeAiConfigFile(sanitized)) {
+              ai_config_cache = std::move(sanitized);
+              BOOST_LOG(info) << "Migrated the LLM API key out of ai_config.json";
+            } else {
+              BOOST_LOG(error) << "The LLM API key was secured, but ai_config.json could not be sanitized; migration will retry";
+            }
+          } else {
+            BOOST_LOG(error) << "Could not migrate the plaintext LLM API key: " << migration.error;
+          }
+          ai_config_cache["apiKey"] = legacy_key;
+        } else {
+          applyStoredCredentialLocked(ai_config_cache);
+        }
+        ai_config_cache["apiKeyConfigured"] = !ai_config_cache.value("apiKey", "").empty();
         ai_config_loaded = true;
         return ai_config_cache;
       }
@@ -2293,11 +2803,13 @@ namespace confighttp {
       {"provider", "openai"},
       {"apiBase", "https://api.openai.com/v1"},
       {"apiKey", ""},
+      {"apiKeyConfigured", false},
       {"model", "gpt-4.1-mini"},
       {"compatibility", "openai-chat"},
       {"temperature", 0.3},
       {"max_tokens", 2048}
     };
+    applyStoredCredentialLocked(ai_config_cache);
     ai_config_loaded = true;
     return ai_config_cache;
   }
@@ -2316,19 +2828,14 @@ namespace confighttp {
    */
   static bool
   saveAiConfigLocked(const nlohmann::json &cfg) {
-    auto path = getAiConfigPath();
-    try {
-      std::ofstream file(path);
-      if (file.is_open()) {
-        file << cfg.dump(2);
-        ai_config_cache = cfg;
-        ai_config_loaded = true;
-        return true;
-      }
-    } catch (const std::exception &e) {
-      BOOST_LOG(error) << "Failed to save AI config: " << e.what();
-    }
-    return false;
+    auto persisted = cfg;
+    persisted.erase("apiKey");
+    persisted.erase("apiKeyConfigured");
+    persisted.erase("apiKeyHint");
+    if (!writeAiConfigFile(persisted)) return false;
+    ai_config_cache = cfg;
+    ai_config_loaded = true;
+    return true;
   }
 
   /**
@@ -2627,15 +3134,10 @@ namespace confighttp {
 
     auto cfg = loadAiConfig();
 
-    // 掩码 API key：仅显示前4+后4字符
-    if (cfg.contains("apiKey") && cfg["apiKey"].is_string()) {
-      std::string key = cfg["apiKey"].get<std::string>();
-      if (key.length() > 8) {
-        cfg["apiKey"] = key.substr(0, 4) + "****" + key.substr(key.length() - 4);
-      } else if (!key.empty()) {
-        cfg["apiKey"] = "****";
-      }
-    }
+    // Never expose the key; only report whether one is configured.
+    const std::string key = cfg.value("apiKey", "");
+    cfg.erase("apiKey");
+    cfg["apiKeyConfigured"] = !key.empty();
 
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
@@ -2647,6 +3149,7 @@ namespace confighttp {
    */
   void
   saveAiConfigEndpoint(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
     if (!authenticate(response, request)) return;
     print_req(request);
 
@@ -2668,28 +3171,102 @@ namespace confighttp {
       if (input.contains("system_prompt")) current["system_prompt"] = input["system_prompt"].get<std::string>();
       if (input.contains("temperature")) current["temperature"] = input["temperature"].get<double>();
       if (input.contains("max_tokens")) current["max_tokens"] = input["max_tokens"].get<int>();
-      if (input.contains("apiKey")) {
-        std::string key = input["apiKey"].get<std::string>();
-        // 如果前端发来的是掩码（包含****），不覆盖
-        if (key.find("****") == std::string::npos) {
-          current["apiKey"] = key;
+      std::string key_action = input.value("apiKeyAction", "keep");
+      // Backward compatibility for older clients that only send apiKey.
+      if (input.contains("apiKey") && key_action == "keep") {
+        const std::string candidate = input["apiKey"].get<std::string>();
+        if (!candidate.empty() && candidate.find("****") == std::string::npos) {
+          key_action = "replace";
         }
       }
 
+      if (key_action == "replace") {
+        if (!input.contains("apiKey") || !input["apiKey"].is_string() || input["apiKey"].get_ref<const std::string &>().empty()) {
+          throw std::invalid_argument("apiKeyAction=replace requires a non-empty apiKey");
+        }
+        const std::string key = input["apiKey"].get<std::string>();
+        auto stored = credential_store::write_llm_api_key(getAiCredentialPath(), key);
+        if (!stored.success) throw std::runtime_error("Failed to secure API key: " + stored.error);
+        current["apiKey"] = key;
+      } else if (key_action == "clear") {
+        auto erased = credential_store::erase_llm_api_key(getAiCredentialPath());
+        if (!erased.success) throw std::runtime_error("Failed to clear API key: " + erased.error);
+        current["apiKey"] = "";
+      } else if (key_action != "keep") {
+        throw std::invalid_argument("apiKeyAction must be keep, replace, or clear");
+      }
+      current["apiKeyConfigured"] = !current.value("apiKey", "").empty();
+
       if (saveAiConfigLocked(current)) {
         output["status"] = "ok";
+        output["apiKeyConfigured"] = current["apiKeyConfigured"];
       } else {
         output["status"] = "error";
         output["error"] = "Failed to write config file";
+        // Credential mutations have already completed. Keep runtime behavior
+        // consistent with secure storage even if the non-secret JSON write
+        // failed; the caller still receives an error and can retry.
+        ai_config_cache = current;
+        ai_config_loaded = true;
       }
     } catch (const std::exception &e) {
       output["status"] = "error";
-      output["error"] = std::string("Invalid JSON: ") + e.what();
+      output["error"] = e.what();
     }
 
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     response->write(SimpleWeb::StatusCode::success_ok, output.dump(), headers);
+  }
+
+  void
+  proxyAiModels(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    print_req(request);
+
+    const auto cfg = loadAiConfig();
+    if (!cfg.value("enabled", false)) {
+      response->write(
+        SimpleWeb::StatusCode::client_error_forbidden,
+        R"({"error":{"message":"AI proxy is not enabled","type":"invalid_request_error"}})",
+        json_headers());
+      return;
+    }
+    const std::string api_key = cfg.value("apiKey", "");
+    std::string api_base = cfg.value("apiBase", "");
+    if (api_base.empty() || (api_key.empty() && isApiKeyRequired(cfg))) {
+      response->write(
+        SimpleWeb::StatusCode::client_error_bad_request,
+        R"({"error":{"message":"AI proxy not configured","type":"invalid_request_error"}})",
+        json_headers());
+      return;
+    }
+    if (isAnthropicProvider(cfg)) {
+      response->write(SimpleWeb::StatusCode::success_ok, R"({"data":[]})", json_headers());
+      return;
+    }
+
+    while (!api_base.empty() && api_base.back() == '/') api_base.pop_back();
+    if (hasSuffix(api_base, "/chat/completions")) {
+      api_base.resize(api_base.size() - std::string_view { "/chat/completions" }.size());
+    }
+    const std::string target_url = api_base + "/models";
+    std::map<std::string, std::string> headers;
+    if (!api_key.empty()) headers["Authorization"] = "Bearer " + api_key;
+
+    std::string body;
+    long http_code = 0;
+    if (!http::get_json(target_url, headers, body, http_code)) {
+      response->write(
+        SimpleWeb::StatusCode::server_error_bad_gateway,
+        R"({"error":{"message":"Failed to connect to upstream LLM API","type":"upstream_error"}})",
+        json_headers());
+      return;
+    }
+    const auto status = http_code >= 200 && http_code < 300
+                          ? SimpleWeb::StatusCode::success_ok
+                          : SimpleWeb::StatusCode::server_error_bad_gateway;
+    response->write(status, body, json_headers());
   }
 
   /**
@@ -3191,6 +3768,13 @@ namespace confighttp {
     server.resource["^/api/apps$"]["POST"] = saveApp;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
+    server.resource["^/api/webhook/config$"]["GET"] = getWebhookConfig;
+    server.resource["^/api/webhook/config$"]["POST"] = saveWebhookConfig;
+    server.resource["^/api/webhook/test$"]["POST"] = testWebhook;
+#ifdef _WIN32
+    server.resource["^/api/dualsense/config$"]["GET"] = getDualSenseConfig;
+    server.resource["^/api/dualsense/config$"]["POST"] = saveDualSenseConfig;
+#endif
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
     server.resource["^/api/logout$"]["GET"] = handleLogout;
     server.resource["^/api/logout$"]["POST"] = handleLogout;
@@ -3198,6 +3782,7 @@ namespace confighttp {
     server.resource["^/api/restart$"]["GET"] = restart;
     server.resource["^/api/boom$"]["GET"] = boom;
     server.resource["^/api/reset-display-device-persistence$"]["POST"] = resetDisplayDevicePersistence;
+    server.resource["^/api/microphone/test$"]["POST"] = testMicrophone;
 #ifdef _WIN32
     server.resource["^/api/vdd/status$"]["GET"] = getVddStatus;
     server.resource["^/api/vulkan-hdr-bridge$"]["GET"] = getVulkanHdrBridgeStatus;
@@ -3208,19 +3793,23 @@ namespace confighttp {
     server.resource["^/api/apps/batch-delete$"]["POST"] = batchDeleteApps;
     server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
     server.resource["^/api/clients/list$"]["GET"] = listClients;
-    server.resource["^/api/clients/list$"]["POST"] = saveConfig;
+    server.resource["^/api/clients/list$"]["POST"] = saveClients;
+    server.resource["^/api/color-profiles$"]["GET"] = listColorProfiles;
     server.resource["^/api/clients/unpair$"]["POST"] = unpair;
     server.resource["^/api/clients/rename$"]["POST"] = renameClient;
     server.resource["^/api/apps/close$"]["POST"] = closeApp;
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     server.resource["^/api/apps/test-menu-cmd$"]["POST"] = testMenuCmd;
     server.resource["^/api/runtime/sessions$"]["GET"] = getRuntimeSessions;
+    server.resource["^/api/runtime/hdr$"]["GET"] = getRuntimeHdrStatus;
+    server.resource["^/api/runtime/hdr-calibration$"]["GET"] = getRuntimeHdrCalibration;
     server.resource["^/api/runtime/bitrate$"]["GET"] = changeRuntimeBitrate;
     server.resource["^/api/perf/current$"]["GET"] = getPerfCurrent;
     server.resource["^/steam-api/.+$"]["GET"] = proxySteamApi;
     server.resource["^/steam-store/.+$"]["GET"] = proxySteamStore;
     server.resource["^/api/ai/config$"]["GET"] = getAiConfig;
     server.resource["^/api/ai/config$"]["POST"] = saveAiConfigEndpoint;
+    server.resource["^/api/ai/models$"]["GET"] = proxyAiModels;
     server.resource["^/api/ai/chat/completions$"]["POST"] = proxyAiChat;
     server.resource["^/api/ai/chat/completions$"]["OPTIONS"] = handleAiCors;
     server.resource["^/api/v1/file-mapping/mappings$"]["GET"] = listFileMappings;
@@ -3229,6 +3818,8 @@ namespace confighttp {
     server.resource["^/api/v1/file-mapping/mappings/([A-Za-z0-9_\\-]{1,64})$"]["DELETE"] = deleteFileMapping;
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
     server.resource["^/images/logo-sunshine-256.png$"]["GET"] = getSunshineLogoImage;
+    server.resource["^/images/logo-alkaidlab.png$"]["GET"] = getAlkaidLabLogoImage;
+    server.resource["^/images/logo-natpierce.png$"]["GET"] = getNatPierceLogoImage;
     server.resource["^/boxart/.+$"]["GET"] = getBoxArt;
 
     // Clipboard sync routes are registered in a sibling module so the
@@ -3254,6 +3845,10 @@ namespace confighttp {
     // file upload, etc.) doesn't block other web UI requests on the same
     // single-threaded io_service.
     server.config.thread_pool_size = 2;
+    // Enforce the limit while Simple-Web-Server is buffering the request, before
+    // individual handlers parse it. This still leaves headroom for the 10 MiB
+    // base64 cover-upload endpoint.
+    server.config.max_request_streambuf_size = 16 * 1024 * 1024;
 
     auto accept_and_run = [&](https_server_t *server) {
       try {

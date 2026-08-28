@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initguid.h>
+#include <iterator>
 #include <thread>
 
 #include <boost/algorithm/string/join.hpp>
@@ -30,6 +31,7 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE: DWORD {
 #include "display_device/windows_utils.h"
 #include "misc.h"
 #include "src/config.h"
+#include "src/cursor_channel.h"
 #include "src/display_device/display_device.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -162,6 +164,43 @@ namespace platf::dxgi {
         BOOST_LOG(error) << "Couldn't acquire next frame [0x"sv << util::hex(status).to_string_view();
         return capture_e::error;
     }
+  }
+
+  capture_e
+  duplication_t::update_cursor(const DXGI_OUTDUPL_FRAME_INFO &frame_info,
+                               bool &shape_updated) {
+    shape_updated = false;
+    if (frame_info.PointerShapeBufferSize > 0) {
+      std::vector<std::uint8_t> img_data(frame_info.PointerShapeBufferSize);
+      DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info {};
+      UINT actual_size = 0;
+      const auto status = dup->GetFramePointerShape(
+        static_cast<UINT>(img_data.size()),
+        img_data.data(),
+        &actual_size,
+        &shape_info
+      );
+      if (FAILED(status) || actual_size > img_data.size()) {
+        BOOST_LOG(error) << "Failed to get new pointer shape [0x"sv
+                         << util::hex(status).to_string_view() << ']';
+        return capture_e::error;
+      }
+
+      img_data.resize(actual_size);
+      cursor.img_data = std::move(img_data);
+      cursor.shape_info = shape_info;
+      do {
+        ++cursor.shape_id;
+      } while (cursor.shape_id == 0);
+      shape_updated = true;
+    }
+
+    if (frame_info.LastMouseUpdateTime.QuadPart) {
+      cursor.x = frame_info.PointerPosition.Position.x;
+      cursor.y = frame_info.PointerPosition.Position.y;
+      cursor.visible = frame_info.PointerPosition.Visible;
+    }
+    return capture_e::ok;
   }
 
   capture_e
@@ -1058,6 +1097,15 @@ namespace platf::dxgi {
 
   const char *
   display_base_t::dxgi_format_to_string(DXGI_FORMAT format) {
+    // The table is indexed directly by the DXGI_FORMAT value, but it only covers the
+    // contiguous range of documented formats and contains NULL holes for the reserved
+    // values between B4G4R4A4_UNORM (115) and P208 (130). Formats outside that range
+    // (e.g. A4B4G4R4_UNORM = 191, the sampler feedback opaque formats, or a bogus value
+    // from a driver) would otherwise read out of bounds, and the NULL holes would be
+    // streamed as a null char pointer, which is undefined behavior.
+    if (format >= std::size(format_str) || !format_str[format]) {
+      return "DXGI_FORMAT_UNRECOGNIZED";
+    }
     return format_str[format];
   }
 
@@ -1177,6 +1225,7 @@ namespace platf {
       }
 
       if (ret) {
+        cursor_channel::set_producer_available(type == "ddx" || type == "vdd");
         return ret;
       }
 
@@ -1186,6 +1235,7 @@ namespace platf {
     }
 
     BOOST_LOG(error) << "Failed to create display for: " << display_name;
+    cursor_channel::set_producer_available(false);
     return nullptr;
   }
 

@@ -61,7 +61,30 @@ second polling loop.
 On Windows, the service wrapper starts the packaged GUI agent in the active
 signed-in user's session after Core starts. Failed launches are retried while
 Core remains alive, and the GUI's single-instance guard absorbs duplicate
-logon and service-start attempts.
+logon and service-start attempts. A zero GUI process exit code suppresses
+service-initiated launches for the current Core lifecycle. The wrapper still
+performs a low-frequency lookup for an instance started outside the service,
+such as an elevated or updater-launched replacement, and resumes normal process
+supervision after attaching to it. A new Core lifecycle or active console
+session also restores service-initiated launches. Nonzero exits remain crashes
+and are restarted with bounded backoff.
+
+The GUI keeps its tray while Core is unavailable. It switches to a distinct
+disconnected presentation, disables Core-dependent commands, and keeps local
+recovery and diagnostic commands available. On Windows, the disconnected menu
+can restart the Sunshine service. Recovery remains pending until the GUI
+receives a new accepted Core state response from its monitor. On Windows this
+is a local packaged-GUI command, not a Core `/api/tray/action`: the Tauri backend
+uses the existing elevated PowerShell service-restart path. Its command result
+only confirms that the restart was dispatched; it does not declare Core ready
+and is not exposed to remote tray providers.
+
+The 30-second recovery timeout starts after that restart command returns. Only
+an accepted `GET /api/tray/state` snapshot or SSE `tray-state` event received
+after the attempt began completes recovery. SSE keepalives, connection setup,
+error responses, cached state, and tray-action responses do not. Timeout clears
+the active attempt and re-enables manual retry; it does not cancel an OS restart
+already in progress or stop background Core monitoring.
 
 ## Actions and operations
 
@@ -90,6 +113,21 @@ from closing a newer VDD.
 Long-running actions return an `operation_id`; their current `running`,
 `succeeded`, or `failed` result is published in the state `operation` object.
 Operations execute serially and are joined during Core shutdown.
+
+## Signed client fingerprint rules
+
+The packaged GUI may act as a low-frequency transport for warning-only client
+fingerprint rules:
+
+- `GET /api/tray/client-fingerprint-rules` returns Core's active rule status.
+- `POST /api/tray/client-fingerprint-rules` accepts
+  `{ "envelope": "<signed envelope JSON>" }`.
+
+The endpoint is local and uses the same authentication policy as tray actions.
+Core treats the provider and request body as untrusted: it independently
+verifies the pinned X.509 signature, schema, expiry, monotonic revision, and
+size limits before persisting and activating the candidate. The provider must
+not interpret rules or make client classification decisions.
 
 ## Future providers
 

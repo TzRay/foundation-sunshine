@@ -323,16 +323,15 @@ namespace input {
   void
   print(PSS_TOUCH_PACKET packet) {
     BOOST_LOG(debug)
-      << "--begin touch packet--"sv << std::endl
-      << "eventType ["sv << util::hex(packet->eventType).to_string_view() << ']' << std::endl
-      << "pointerId ["sv << util::hex(packet->pointerId).to_string_view() << ']' << std::endl
-      << "x ["sv << from_netfloat(packet->x) << ']' << std::endl
-      << "y ["sv << from_netfloat(packet->y) << ']' << std::endl
-      << "pressureOrDistance ["sv << from_netfloat(packet->pressureOrDistance) << ']' << std::endl
-      << "contactAreaMajor ["sv << from_netfloat(packet->contactAreaMajor) << ']' << std::endl
-      << "contactAreaMinor ["sv << from_netfloat(packet->contactAreaMinor) << ']' << std::endl
-      << "rotation ["sv << (uint32_t) packet->rotation << ']' << std::endl
-      << "--end touch packet--"sv;
+      << "Touch packet: "sv
+      << "eventType ["sv << util::hex(packet->eventType).to_string_view() << "], "sv
+      << "pointerId ["sv << util::hex(packet->pointerId).to_string_view() << "], "sv
+      << "x ["sv << from_netfloat(packet->x) << "], "sv
+      << "y ["sv << from_netfloat(packet->y) << "], "sv
+      << "pressureOrDistance ["sv << from_netfloat(packet->pressureOrDistance) << "], "sv
+      << "contactAreaMajor ["sv << from_netfloat(packet->contactAreaMajor) << "], "sv
+      << "contactAreaMinor ["sv << from_netfloat(packet->contactAreaMinor) << "], "sv
+      << "rotation ["sv << (uint32_t) packet->rotation << ']';
   }
 
   /**
@@ -405,18 +404,17 @@ namespace input {
   void
   print(PSS_PEN_PACKET packet) {
     BOOST_LOG(debug)
-      << "--begin pen packet--"sv << std::endl
-      << "eventType ["sv << util::hex(packet->eventType).to_string_view() << ']' << std::endl
-      << "toolType ["sv << util::hex(packet->toolType).to_string_view() << ']' << std::endl
-      << "penButtons ["sv << util::hex(packet->penButtons).to_string_view() << ']' << std::endl
-      << "x ["sv << from_netfloat(packet->x) << ']' << std::endl
-      << "y ["sv << from_netfloat(packet->y) << ']' << std::endl
-      << "pressureOrDistance ["sv << from_netfloat(packet->pressureOrDistance) << ']' << std::endl
-      << "contactAreaMajor ["sv << from_netfloat(packet->contactAreaMajor) << ']' << std::endl
-      << "contactAreaMinor ["sv << from_netfloat(packet->contactAreaMinor) << ']' << std::endl
-      << "rotation ["sv << (uint32_t) packet->rotation << ']' << std::endl
-      << "tilt ["sv << (uint32_t) packet->tilt << ']' << std::endl
-      << "--end pen packet--"sv;
+      << "Pen packet: "sv
+      << "eventType ["sv << util::hex(packet->eventType).to_string_view() << "], "sv
+      << "toolType ["sv << util::hex(packet->toolType).to_string_view() << "], "sv
+      << "penButtons ["sv << util::hex(packet->penButtons).to_string_view() << "], "sv
+      << "x ["sv << from_netfloat(packet->x) << "], "sv
+      << "y ["sv << from_netfloat(packet->y) << "], "sv
+      << "pressureOrDistance ["sv << from_netfloat(packet->pressureOrDistance) << "], "sv
+      << "contactAreaMajor ["sv << from_netfloat(packet->contactAreaMajor) << "], "sv
+      << "contactAreaMinor ["sv << from_netfloat(packet->contactAreaMinor) << "], "sv
+      << "rotation ["sv << (uint32_t) packet->rotation << "], "sv
+      << "tilt ["sv << (uint32_t) packet->tilt << ']';
   }
 
   /**
@@ -1420,10 +1418,10 @@ namespace input {
     short deltaX, deltaY;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
+    if (__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
       return batch_result_e::terminate_batch;
     }
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
+    if (__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1462,7 +1460,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
+    if (__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1483,7 +1481,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
+    if (__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1657,9 +1655,8 @@ namespace input {
    */
   batch_result_e
   batch(PSS_PEN_PACKET dest, PSS_PEN_PACKET src) {
-    // Only batch hover or move events
-    if (dest->eventType != LI_TOUCH_EVENT_MOVE &&
-        dest->eventType != LI_TOUCH_EVENT_HOVER) {
+    // 保留所有落笔采样，仅以新的悬停位置替换队列中已过时的悬停位置。
+    if (dest->eventType != LI_TOUCH_EVENT_HOVER) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1817,11 +1814,20 @@ namespace input {
       payload = (PNV_INPUT_HEADER) entry.data();
       input->input_queue.pop_front();
 
+      if (!input->activity_tracker.evaluate(payload, entry.size()).has_value()) {
+        return;
+      }
+
       // Try to batch with remaining items on the queue
       auto i = input->input_queue.begin();
       while (i != input->input_queue.end()) {
         auto batchable_entry = *i;
         auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
+
+        if (!input->activity_tracker.evaluate(batchable_payload, batchable_entry.size()).has_value()) {
+          i = input->input_queue.erase(i);
+          continue;
+        }
 
         auto batch_result = batch(payload, batchable_payload);
         if (batch_result == batch_result_e::terminate_batch) {
@@ -1842,9 +1848,9 @@ namespace input {
     // Print the final input packet
     input::print((void *) payload);
 
+    const auto activity = input->activity_tracker.evaluate(payload, entry.size());
     const bool should_raise_input_activity =
-      config::video.input_activity_boost &&
-      input->activity_tracker.evaluate(payload);
+      config::video.input_activity_boost && activity.value_or(false);
 
     // Send the batched input to the OS
     switch (util::endian::little(payload->magic)) {

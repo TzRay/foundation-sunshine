@@ -2516,6 +2516,36 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### [nvenc_cuda_array_input](https://localhost:47990/config/#nvenc_cuda_array_input)
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Feed 10-bit 4:4:4 frames to NVENC through a block-linear CUDA array instead of the pitch-linear
+            device pointer.
+            @note{Windows only. Requires a driver exposing NVENC 13.1 or newer; on older drivers Sunshine
+            logs a message and keeps using the device pointer. Encoder probing always uses the device
+            pointer, so this option only affects real streaming sessions.}
+            @warning{Experimental. Some drivers produce ghosted output with the array path. Leave it
+            disabled unless you are helping test the 4:4:4 path. If a stream misbehaves, disable
+            `nvenc_cuda_array_input` and restart the stream.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_cuda_array_input = disabled
+            @endcode</td>
+    </tr>
+</table>
+
 ## [Intel QuickSync Encoder](https://localhost:47990/config/#intel-quicksync-encoder)
 
 ### [qsv_preset](https://localhost:47990/config/#qsv_preset)

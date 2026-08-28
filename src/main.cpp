@@ -4,18 +4,24 @@
  */
 // standard includes
 #include <atomic>
+#include <chrono>
 #include <codecvt>
 #include <csignal>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <thread>
+#include <utility>
 
 // lib includes
 #include <rs.h>
 
 // local includes
+#include "client_fingerprint.h"
 #include "confighttp.h"
 #include "display_device/session.h"
 #include "entry_handler.h"
+#include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
 #include "logging.h"
@@ -26,6 +32,9 @@
 #include "upnp.h"
 #include "version.h"
 #include "video.h"
+#include "webhook/webhook.h"
+#include "webhook/webhook_auth.h"
+#include "ds5/config.h"
 
 #ifdef _WIN32
   #include "platform/windows/misc.h"
@@ -101,10 +110,12 @@ ConsoleCtrlHandler(DWORD type) {
 }
 #endif
 
+// Unused on Windows when the GUI agent owns the tray (SUNSHINE_TRAY=0): the
+// only remaining reader is the POSIX main-loop condition below.
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-constexpr bool tray_is_enabled = true;
+[[maybe_unused]] constexpr bool tray_is_enabled = true;
 #else
-constexpr bool tray_is_enabled = false;
+[[maybe_unused]] constexpr bool tray_is_enabled = false;
 #endif
 
 void
@@ -125,8 +136,62 @@ mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
 
   // Main thread event loop
   BOOST_LOG(info) << "Starting main loop"sv;
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
   while (system_tray::process_tray_events() == 0);
+#else
+  // Only the in-process tray sets run_loop, so this build cannot reach here.
+  // Block on shutdown anyway: falling through would return to main() and tear
+  // the host down immediately if another main-thread feature is ever added.
+  shutdown_event->view();
+#endif
   BOOST_LOG(info) << "Main loop has exited"sv;
+}
+
+/**
+ * @brief Run the encoder probe, reporting progress so a stall is diagnosable.
+ *
+ * The probe talks to the graphics driver and cannot be safely interrupted from
+ * the outside — a hung driver call owns its thread until it returns. So the
+ * watchdog does not try to cancel anything; it only keeps writing to the log
+ * while the probe is outstanding. That turns "Sunshine started but streaming
+ * never works and nobody knows why" into a timestamped line naming the phase
+ * that is stuck.
+ */
+void
+probe_encoders_with_watchdog() {
+  constexpr auto report_interval = 30s;
+
+  std::promise<void> probe_finished;
+  auto probe_finished_future = probe_finished.get_future();
+
+  BOOST_LOG(info) << "Probing for supported encoders..."sv;
+  const auto probe_started_at = std::chrono::steady_clock::now();
+
+  std::thread watchdog([&probe_finished_future, report_interval, probe_started_at]() {
+    while (probe_finished_future.wait_for(report_interval) == std::future_status::timeout) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - probe_started_at);
+      BOOST_LOG(warning) << "Encoder probe has been running for "sv << elapsed.count()
+                         << "s and has not returned. This usually means a graphics driver call "
+                            "is stuck. Streaming will not work until it completes; the web UI is "
+                            "already available so the configuration can be changed."sv;
+    }
+  });
+
+  const bool probe_failed = video::probe_encoders();
+
+  probe_finished.set_value();
+  watchdog.join();
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - probe_started_at);
+
+  if (probe_failed) {
+    BOOST_LOG(error) << "Video failed to find working encoder (probe took "sv << elapsed.count() << "ms)"sv;
+  }
+  else {
+    BOOST_LOG(info) << "Encoder probe completed in "sv << elapsed.count() << "ms"sv;
+  }
 }
 
 int
@@ -361,6 +426,25 @@ main(int argc, char *argv[]) {
 
   proc::refresh(config::stream.file_apps);
 
+#ifdef _WIN32
+  ds5_config::load_result_t ds5_settings_result {
+    ds5_config::load_status_t::INVALID,
+    {}
+  };
+  try {
+    ds5_settings_result = ds5_config::load(
+      ds5_config::path_for(file_handler::path_from_utf8(config::sunshine.config_file))
+    );
+  }
+  catch (...) {
+  }
+  if (ds5_settings_result.status == ds5_config::load_status_t::INVALID ||
+      !ds5_config::configure(std::move(ds5_settings_result.settings))) {
+    BOOST_LOG(error) << "DualSense configuration is invalid; DualSense emulation is disabled"sv;
+    ds5_config::configure({});
+  }
+#endif
+
   // If any of the following fail, we log an error and continue event though sunshine will not function correctly.
   // This allows access to the UI to fix configuration problems or view the logs.
 
@@ -381,10 +465,6 @@ main(int argc, char *argv[]) {
     BOOST_LOG(warning) << "No gamepad input is available"sv;
   }
 
-  if (video::probe_encoders()) {
-    BOOST_LOG(error) << "Video failed to find working encoder"sv;
-  }
-
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
 
@@ -394,6 +474,15 @@ main(int argc, char *argv[]) {
 #endif
 
     return -1;
+  }
+
+  auto client_fingerprint_deinit_guard = client_fingerprint::init({
+    .remote_rules_enabled = config::nvhttp.client_fingerprint_remote_rules,
+    .signing_certificate = file_handler::path_from_utf8(config::nvhttp.client_fingerprint_rules_certificate),
+    .cache_file = platf::appdata() / "client-fingerprint-rules.json",
+  });
+  if (!client_fingerprint_deinit_guard) {
+    BOOST_LOG(warning) << "Client fingerprint rules are unavailable; using built-in rules";
   }
 
   std::unique_ptr<platf::deinit_t> mDNS;
@@ -415,8 +504,48 @@ main(int argc, char *argv[]) {
     return lifetime::desired_exit_code;
   }
 
-  std::thread httpThread { nvhttp::start };
+  webhook::auth::load_result_t webhook_auth_result {
+    webhook::auth::load_status_t::INVALID,
+    {}
+  };
+  try {
+    webhook_auth_result = webhook::auth::load(
+      webhook::auth::path_for(config::sunshine.config_file)
+    );
+  }
+  catch (...) {
+    // Treat path construction failures exactly like an invalid Webhook file.
+    // Webhook configuration must never abort Sunshine startup.
+  }
+  const bool webhook_configured = webhook::configure(std::move(webhook_auth_result.settings));
+  if (webhook_auth_result.status == webhook::auth::load_status_t::INVALID ||
+      !webhook_configured) {
+    BOOST_LOG(error) << "Webhook configuration is invalid; Webhook delivery is disabled"sv;
+  }
+
+  auto webhook_deinit_guard = webhook::init();
+  if (!webhook_deinit_guard || !webhook::runtime_active()) {
+    BOOST_LOG(warning) << "Webhook runtime is unavailable; Sunshine will continue without Webhook delivery"sv;
+  }
+
+  // Start the configuration web UI before probing encoders.
+  //
+  // probe_encoders() drives the graphics driver directly, and a bad driver or a
+  // bad encoder option can make it block for a very long time or forever. When
+  // the probe ran on the main thread ahead of every server, such a stall meant
+  // the web UI never bound its port: the service looked healthy, but the user
+  // had no way to read the logs or undo the option that caused the stall.
+  //
+  // confighttp does not consume probe results. It reads the active encoder name
+  // through an atomic (empty until the probe lands) and HDR pipeline status
+  // under its own mutex, so bringing it up early races with nothing. nvhttp and
+  // rtsp_stream do depend on the probe (codec support flags, YUV444 support),
+  // so they stay behind it.
   std::thread configThread { confighttp::start };
+
+  probe_encoders_with_watchdog();
+
+  std::thread httpThread { nvhttp::start };
   std::thread rtspThread { rtsp_stream::start };
 
 #if defined(_WIN32) && defined(SUNSHINE_GUI_TRAY) && SUNSHINE_GUI_TRAY >= 1
@@ -440,21 +569,29 @@ main(int argc, char *argv[]) {
   }
 #endif
 
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
   if (tray_is_enabled && config::sunshine.system_tray) {
     BOOST_LOG(info) << "Starting system tray"sv;
-#ifdef _WIN32
+  #ifdef _WIN32
     // TODO: Windows has a weird bug where when running as a service and on the first Windows boot,
     // he tray icon would not appear even though Sunshine is running correctly otherwise.
     // Restarting the service would allow the icon to appear normally.
     // For now we will keep the Windows tray icon on a separate thread.
     // Ideally, we would run the system tray on the main thread for all platforms.
     system_tray::init_tray_threaded();
-#else
+  #else
     system_tray::init_tray();
-#endif
+  #endif
   }
+#endif
 
   mainThreadLoop(shutdown_event);
+
+  client_fingerprint_deinit_guard.reset();
+
+  // Stop outbound callbacks before joining inbound servers. This cancels
+  // queued tests while their response objects are still valid.
+  webhook_deinit_guard.reset();
 
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
   system_tray::end_tray();

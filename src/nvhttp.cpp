@@ -8,6 +8,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -21,6 +22,7 @@
 
 // lib includes
 #include <Simple-Web-Server/server_http.hpp>
+#include <boost/atomic.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
@@ -31,6 +33,7 @@
 #include <openssl/ssl.h>
 
 // local includes
+#include "client_fingerprint.h"
 #include "config.h"
 #include "confighttp.h"
 #include "display_device/session.h"
@@ -39,6 +42,7 @@
 #include "file_mapping/file_mapping_http.h"
 #include "file_mapping/service.h"
 #include "globals.h"
+#include "hdr/session_target.h"
 #include "httpcommon.h"
 #include "logging.h"
 #include "network.h"
@@ -50,6 +54,7 @@
 #include "nvhttp/display_control.h"
 #include "nvhttp/display_scale.h"
 #include "nvhttp/dynamic_params.h"
+#include "nvhttp/network_probe.h"
 #include "nvhttp/pairing.h"
 #include "nvhttp/sessions.h"
 #include "nvhttp/tls_client_identity_store.h"
@@ -63,7 +68,7 @@
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
-#include "webhook.h"
+#include "webhook/webhook.h"
 
 using json = nlohmann::json;
 
@@ -79,7 +84,8 @@ namespace nvhttp {
     "/favicon.ico", "/favicon.png", "/favicon.svg"
   };
 
-  std::atomic<uint32_t> session_id_counter;
+  boost::atomic<uint32_t> session_id_counter {0};
+  static boost::atomic_flag global_cancel_pending = BOOST_ATOMIC_FLAG_INIT;
 
   static tls_client_identity_store_t tls_client_identities;
 
@@ -232,6 +238,12 @@ namespace nvhttp {
     return it->second;
   }
 
+  std::optional<std::string_view>
+  find_arg(const args_t &args, const char *name) {
+    const auto it = args.find(name);
+    return it == args.end() ? std::nullopt : std::make_optional<std::string_view>(it->second);
+  }
+
   std::shared_ptr<rtsp_stream::launch_session_t>
   make_launch_session(bool host_audio, const args_t &args) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
@@ -263,9 +275,35 @@ namespace nvhttp {
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
     launch_session->use_vdd = util::from_view(get_arg(args, "useVdd", "0"));
     launch_session->custom_screen_mode = util::from_view(get_arg(args, "customScreenMode", "-1"));
-    launch_session->max_nits = std::stof(get_arg(args, "maxBrightness", "1000"));
-    launch_session->min_nits = std::stof(get_arg(args, "minBrightness", "0.001"));
-    launch_session->max_full_nits = std::stof(get_arg(args, "maxAverageBrightness", "1000"));
+    const auto hdr_capabilities = hdr::parse_client_display_capabilities(
+      find_arg(args, "maxBrightness"),
+      find_arg(args, "minBrightness"),
+      find_arg(args, "maxAverageBrightness"));
+    launch_session->reported_hdr_capabilities = hdr_capabilities.capabilities;
+    launch_session->hdr_capabilities = hdr_capabilities.capabilities;
+    launch_session->hdr_target_source = hdr_capabilities.capabilities.reported ?
+                                          hdr::target_source_e::client_report :
+                                          hdr::target_source_e::safe_defaults;
+    if (!hdr_capabilities.fallback_reason.empty()) {
+      BOOST_LOG(warning) << hdr_capabilities.fallback_reason << "; using safe HDR luminance defaults";
+    }
+
+    // Optional client-measured SDR reference white (moonlight-harmony extension).
+    // Parsed independently: a missing or out-of-range value simply leaves 0.
+    if (const auto sdr_white = find_arg(args, "sdrBrightness")) {
+      int parsed_sdr_white = 0;
+      const char *begin = sdr_white->data();
+      const char *end = begin + sdr_white->size();
+      const auto [position, parse_error] = std::from_chars(begin, end, parsed_sdr_white);
+      if (parse_error == std::errc {} && position == end && parsed_sdr_white >= 50 && parsed_sdr_white <= 1000) {
+        launch_session->reported_hdr_capabilities.sdr_white_nits = static_cast<float>(parsed_sdr_white);
+        launch_session->hdr_capabilities.sdr_white_nits = static_cast<float>(parsed_sdr_white);
+        BOOST_LOG(info) << "Client reported SDR white level: " << parsed_sdr_white << " nits";
+      }
+      else {
+        BOOST_LOG(warning) << "Ignoring out-of-range client SDR white level: " << *sdr_white;
+      }
+    }
 
     // Get display_name from query parameter if provided
     std::string display_name = get_arg(args, "display_name", "");
@@ -305,6 +343,7 @@ namespace nvhttp {
     launch_session->env["SUNSHINE_CLIENT_HEIGHT"] = std::to_string(launch_session->height);
     launch_session->env["SUNSHINE_CLIENT_FPS"] = std::to_string(launch_session->fps);
     launch_session->env["SUNSHINE_CLIENT_HDR"] = launch_session->enable_hdr ? "true" : "false";
+    launch_session->sync_hdr_environment();
     launch_session->env["SUNSHINE_CLIENT_GCMAP"] = std::to_string(launch_session->gcmap);
     launch_session->env["SUNSHINE_CLIENT_HOST_AUDIO"] = launch_session->host_audio ? "true" : "false";
     launch_session->env["SUNSHINE_CLIENT_ENABLE_SOPS"] = launch_session->enable_sops ? "true" : "false";
@@ -607,12 +646,23 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     const auto launch_session = make_launch_session(host_audio, args);
     launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto fingerprint_match = client_fingerprint::match_client(args);
+    launch_session->highly_suspected_unknown_client = fingerprint_match.suspicious;
 
     // Store the stable client certificate UUID in the launch environment.
     std::string client_cert_uuid = get_client_cert_uuid_from_request(request);
     if (!client_cert_uuid.empty()) {
       launch_session->client_cert_uuid = client_cert_uuid;
       launch_session->env["SUNSHINE_CLIENT_CERT_UUID"] = client_cert_uuid;
+    }
+    hdr::resolve_session_target(*launch_session);
+    if (launch_session->highly_suspected_unknown_client) {
+      BOOST_LOG(warning) << "Launch request highly resembles a known unauthorized client fork"
+                         << " [client_uuid=" << client_cert_uuid
+                         << ", client_name=" << launch_session->client_name
+                         << ", rule_id=" << fingerprint_match.rule_id
+                         << ", rule_revision=" << fingerprint_match.revision
+                         << ", rule_source=" << fingerprint_match.source << ']';
     }
 
     if (rtsp_stream::session_count() == 0) {
@@ -666,21 +716,32 @@ namespace nvhttp {
                                    std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
     tree.put("root.gamesession", 1);
 
-    // Send webhook notification for successful launch
-    webhook::send_event_async(webhook::event_t {
-      .type = webhook::event_type_t::NV_APP_LAUNCH,
-      .alert_type = "nv_app_launch",
-      .timestamp = webhook::get_current_timestamp(),
-      .client_name = launch_session->client_name,
-      .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
-      .server_ip = net::addr_to_normalized_string(request->local_endpoint().address()),
-      .app_name = proc::proc.get_app_name(appid),
-      .app_id = appid,
-      .session_id = std::to_string(launch_session->id),
-      .extra_data = {
+    try {
+      std::map<std::string, std::string> extra_data {
         { "resolution", std::to_string(launch_session->width) + "x" + std::to_string(launch_session->height) },
         { "fps", std::to_string(launch_session->fps) },
-        { "host_audio", launch_session->host_audio ? "true" : "false" } } });
+        { "host_audio", launch_session->host_audio ? "true" : "false" }
+      };
+      if (launch_session->highly_suspected_unknown_client) {
+        extra_data.emplace(
+          "client_integrity_warning",
+          client_fingerprint::suspicious_client_code
+        );
+      }
+      webhook::send_event_async(webhook::event_t {
+        .type = webhook::event_type_t::NV_APP_LAUNCH,
+        .timestamp = webhook::get_current_timestamp(),
+        .client_name = launch_session->client_name,
+        .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
+        .server_ip = net::addr_to_normalized_string(request->local_endpoint().address()),
+        .app_name = proc::proc.get_app_name(appid),
+        .app_id = appid,
+        .session_id = std::to_string(launch_session->id),
+        .extra_data = std::move(extra_data) });
+    }
+    catch (...) {
+      BOOST_LOG(error) << "Webhook launch event construction failed"sv;
+    }
 
     // Stream was started successfully, we will restore the state when the app or session terminates
     need_to_restore_display_state = false;
@@ -753,12 +814,23 @@ namespace nvhttp {
     }
     const auto launch_session = make_launch_session(host_audio, args);
     launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto fingerprint_match = client_fingerprint::match_client(args);
+    launch_session->highly_suspected_unknown_client = fingerprint_match.suspicious;
 
     // Get client certificate UUID (stable client identifier) and store it in env
     std::string client_cert_uuid = get_client_cert_uuid_from_request(request);
     if (!client_cert_uuid.empty()) {
       launch_session->client_cert_uuid = client_cert_uuid;
       launch_session->env["SUNSHINE_CLIENT_CERT_UUID"] = client_cert_uuid;
+    }
+    hdr::resolve_session_target(*launch_session);
+    if (launch_session->highly_suspected_unknown_client) {
+      BOOST_LOG(warning) << "Resume request highly resembles a known unauthorized client fork"
+                         << " [client_uuid=" << client_cert_uuid
+                         << ", client_name=" << launch_session->client_name
+                         << ", rule_id=" << fingerprint_match.rule_id
+                         << ", rule_revision=" << fingerprint_match.revision
+                         << ", rule_source=" << fingerprint_match.source << ']';
     }
 
     if (no_active_sessions) {
@@ -793,21 +865,33 @@ namespace nvhttp {
     tree.put("root.resume", 1);
     need_to_restore_display_state = false;
 
-    // Send webhook notification for successful resume
-    webhook::send_event_async(webhook::event_t {
-      .type = webhook::event_type_t::NV_APP_RESUME,
-      .alert_type = "nv_app_resume",
-      .timestamp = webhook::get_current_timestamp(),
-      .client_name = launch_session->client_name,
-      .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
-      .server_ip = net::addr_to_normalized_string(request->local_endpoint().address()),
-      .app_name = proc::proc.get_app_name(proc::proc.running()),
-      .app_id = proc::proc.running(),
-      .session_id = std::to_string(launch_session->id),
-      .extra_data = {
+    try {
+      const auto app_id = proc::proc.running();
+      std::map<std::string, std::string> extra_data {
         { "resolution", std::to_string(launch_session->width) + "x" + std::to_string(launch_session->height) },
         { "fps", std::to_string(launch_session->fps) },
-        { "host_audio", launch_session->host_audio ? "true" : "false" } } });
+        { "host_audio", launch_session->host_audio ? "true" : "false" }
+      };
+      if (launch_session->highly_suspected_unknown_client) {
+        extra_data.emplace(
+          "client_integrity_warning",
+          client_fingerprint::suspicious_client_code
+        );
+      }
+      webhook::send_event_async(webhook::event_t {
+        .type = webhook::event_type_t::NV_APP_RESUME,
+        .timestamp = webhook::get_current_timestamp(),
+        .client_name = launch_session->client_name,
+        .client_ip = net::addr_to_normalized_string(request->remote_endpoint().address()),
+        .server_ip = net::addr_to_normalized_string(request->local_endpoint().address()),
+        .app_name = proc::proc.get_app_name(app_id),
+        .app_id = app_id,
+        .session_id = std::to_string(launch_session->id),
+        .extra_data = std::move(extra_data) });
+    }
+    catch (...) {
+      BOOST_LOG(error) << "Webhook resume event construction failed"sv;
+    }
   }
 
   void
@@ -833,21 +917,45 @@ namespace nvhttp {
       return;
     }
 
-    const auto result = rtsp_stream::cancel_client_sessions(client_cert_uuid);
-    BOOST_LOG(info) << "Client-scoped cancel [client_uuid="sv << client_cert_uuid
-                    << ", cancelled="sv << result.cancelled_sessions
-                    << ", remaining="sv << result.remaining_sessions << ']';
-
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
-    if (result.remaining_sessions == 0) {
-      if (proc::proc.running() > 0) {
-        proc::proc.terminate();
-      }
+    // GameStream 的 /cancel 表示退出当前应用，而普通断开由 RTSP/控制通道处理。
+    // 清理可能需要等待编码器和应用退出，不能阻塞 NVHTTP 工作线程。
+    if (!global_cancel_pending.test_and_set(boost::memory_order_acq_rel)) {
+      BOOST_LOG(info) << "Global app cancel accepted; stopping all streaming sessions asynchronously"sv;
+      rtsp_stream::terminate_sessions_async(stream::session::stop_reason_e::client_cancel, []() {
+        auto clear_pending = util::fail_guard([]() {
+          global_cancel_pending.clear(boost::memory_order_release);
+        });
 
-      // Preserve the legacy single-client behavior once no other session is using the host.
-      display_device::session_t::get().restore_state();
+        try {
+          if (proc::proc.running() > 0) {
+            proc::proc.terminate();
+          }
+        }
+        catch (const std::exception &e) {
+          BOOST_LOG(error) << "Failed to terminate the running application during app cancel: "sv << e.what();
+        }
+        catch (...) {
+          BOOST_LOG(error) << "Failed to terminate the running application during app cancel"sv;
+        }
+
+        try {
+          display_device::session_t::get().restore_state();
+        }
+        catch (const std::exception &e) {
+          BOOST_LOG(error) << "Failed to restore display state during app cancel: "sv << e.what();
+        }
+        catch (...) {
+          BOOST_LOG(error) << "Failed to restore display state during app cancel"sv;
+        }
+
+        BOOST_LOG(info) << "Global app cancel cleanup finished"sv;
+      });
+    }
+    else {
+      BOOST_LOG(debug) << "Global app cancel is already in progress"sv;
     }
   }
 
@@ -944,6 +1052,7 @@ namespace nvhttp {
     file_mapping_config.authorize_client = is_file_mapping_client_paired;
     file_mapping_service.start(std::move(file_mapping_config));
 
+    network_probe::service_t network_probe_service;
     https_server_t https_server { config::nvhttp.cert, config::nvhttp.pkey };
     http_server_t http_server;
 
@@ -1050,6 +1159,17 @@ namespace nvhttp {
     https_server.resource["^/api/abr/capabilities$"]["GET"] = abr_api::capabilities;
     https_server.resource["^/api/abr$"]["POST"] = abr_api::configure;
     https_server.resource["^/api/abr/feedback$"]["POST"] = abr_api::feedback;
+
+    // Startup bandwidth probe API. These routes inherit nvhttp's paired-client
+    // mTLS authentication and are intentionally absent from the HTTP server.
+    https_server.resource["^/api/network/capabilities$"]["GET"] =
+      [&network_probe_service](resp_https_t resp, req_https_t req) {
+        network_probe_service.capabilities(std::move(resp), std::move(req));
+      };
+    https_server.resource["^/api/network/probe$"]["GET"] =
+      [&network_probe_service](resp_https_t resp, req_https_t req) {
+        network_probe_service.probe(std::move(resp), std::move(req));
+      };
 
     // AI LLM proxy route uses client cert auth from pairing.
     https_server.resource["^/ai/completions$"]["POST"] = ai_api::completions;

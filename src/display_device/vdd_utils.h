@@ -2,15 +2,18 @@
 
 #define WIN32_LEAN_AND_MEAN
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 #include <windows.h>
+
+#include <boost/optional.hpp>
 
 #include "parsed_config.h"
 
@@ -30,6 +33,20 @@ namespace display_device::vdd_utils {
     float max_nits = 1000.0f;
     float min_nits = 0.001f;
     float max_full_nits = 1000.0f;
+
+    bool operator==(const hdr_brightness_t &) const = default;
+
+    // 实测上报的亮度逐会话存在小抖动;容差内视为能力未变,避免无谓重建 VDD
+    bool
+    nearly_equal(const hdr_brightness_t &other) const {
+      constexpr auto close = [](float a, float b) {
+        const float scale = std::min(std::abs(a), std::abs(b));
+        return std::abs(a - b) <= std::max(25.0f, 0.05f * scale);
+      };
+      return close(max_nits, other.max_nits) &&
+             close(min_nits, other.min_nits) &&
+             close(max_full_nits, other.max_full_nits);
+    }
   };
 
   // 物理尺寸结构（厘米）
@@ -52,15 +69,26 @@ namespace display_device::vdd_utils {
     std::vector<unsigned int> refresh_rates_hz;
   };
 
-  constexpr bool
-  advertised_mode_matches(unsigned int width,
+  enum class advertised_mode_match_e {
+    none,
+    exact,
+    rotation_equivalent,
+  };
+
+  /**
+   * @brief Classify a Windows-advertised mode against a client-requested mode.
+   * @details Windows exposes logical width and height after display rotation.
+   *          A swapped match is valid only when the current orientation swaps
+   *          the display axes (90 or 270 degrees).
+   */
+  constexpr advertised_mode_match_e
+  classify_advertised_mode(unsigned int width,
     unsigned int height,
     unsigned int refresh_hz,
-    const display_mode_t &requested_mode) {
-    if (requested_mode.refresh_rate.denominator == 0 ||
-        width != requested_mode.resolution.width ||
-        height != requested_mode.resolution.height) {
-      return false;
+    const display_mode_t &requested_mode,
+    bool orientation_swaps_axes) {
+    if (requested_mode.refresh_rate.denominator == 0) {
+      return advertised_mode_match_e::none;
     }
 
     const auto advertised_scaled =
@@ -70,7 +98,31 @@ namespace display_device::vdd_utils {
     const auto difference = advertised_scaled > requested_scaled ?
                               advertised_scaled - requested_scaled :
                               requested_scaled - advertised_scaled;
-    return difference <= requested_mode.refresh_rate.denominator;
+    if (difference > requested_mode.refresh_rate.denominator) {
+      return advertised_mode_match_e::none;
+    }
+
+    if (width == requested_mode.resolution.width &&
+        height == requested_mode.resolution.height) {
+      return advertised_mode_match_e::exact;
+    }
+
+    if (orientation_swaps_axes &&
+        width == requested_mode.resolution.height &&
+        height == requested_mode.resolution.width) {
+      return advertised_mode_match_e::rotation_equivalent;
+    }
+
+    return advertised_mode_match_e::none;
+  }
+
+  constexpr bool
+  advertised_mode_matches(unsigned int width,
+    unsigned int height,
+    unsigned int refresh_hz,
+    const display_mode_t &requested_mode) {
+    return classify_advertised_mode(width, height, refresh_hz, requested_mode, false) !=
+           advertised_mode_match_e::none;
   }
 
   /**
@@ -81,6 +133,14 @@ namespace display_device::vdd_utils {
    */
   bool
   is_mode_advertised(const std::string &device_id, const display_mode_t &requested_mode);
+
+  /**
+   * @brief Wait until Windows exposes a requested mode for a display device.
+   * @details Uses a bounded deadline internally. Callers do not need to encode
+   *          driver timing assumptions or retry counts.
+   */
+  bool
+  wait_for_mode_publication(const std::string &device_id, const display_mode_t &requested_mode);
 
   struct vdd_status_t {
     std::string state;
@@ -93,7 +153,7 @@ namespace display_device::vdd_utils {
 
     constexpr bool
     is_usable() const {
-      return installed && problem_code_valid && running;
+      return installed && problem_code_valid && running && control_available;
     }
   };
 
@@ -133,23 +193,28 @@ namespace display_device::vdd_utils {
   vdd_status_t
   get_vdd_status();
 
-  // 指数退避计算
-  std::chrono::milliseconds
-  calculate_exponential_backoff(int attempt);
-
-  // VDD命令执行
-  bool
-  execute_vdd_command(const std::string &action);
-
   /**
-   * @brief Ensure ZakoVDD renders the cursor into the framebuffer instead of exposing a hardware cursor plane.
-   * @details Sunshine's direct VDD capture backend consumes only the shared frame texture exported by ZakoVDD.
-   *          Hardware cursor planes are not part of that texture, so they would be invisible to remote clients.
-   * @param changed Optional output set to true when this call had to update the driver setting.
-   * @return True when the setting is already safe or was updated successfully.
+   * @brief Parse the persisted VDD HardwareCursor value.
    */
   bool
-  ensure_hardware_cursor_disabled_for_capture(bool *changed = nullptr);
+  hardware_cursor_export_enabled(std::string value);
+
+  constexpr bool
+  hardware_cursor_export_needs_enable(bool persisted_enabled, bool live_enable_confirmed) {
+    return !persisted_enabled || !live_enable_confirmed;
+  }
+
+  /**
+   * @brief Ensure ZakoVDD continuously exports its hardware cursor channel.
+   * @details Direct VDD capture consumes this channel for both server-side
+   *          composition and client-side local cursor synchronization. Once
+   *          enabled, switching cursor ownership is a session-only operation
+   *          and does not require another driver reload.
+   * @param changed Optional output set to true when this call had to update the driver setting.
+   * @return True when cursor export was already enabled or was updated successfully.
+   */
+  bool
+  ensure_hardware_cursor_enabled_for_capture(bool *changed = nullptr);
 
   /**
    * @brief Outcome of attempting a live SETMODES update.
@@ -219,12 +284,6 @@ namespace display_device::vdd_utils {
   destroy_vdd_monitor_nolog();
 
   void
-  enable_vdd();
-
-  void
-  disable_vdd();
-
-  void
   disable_enable_vdd();
 
   bool
@@ -237,22 +296,22 @@ namespace display_device::vdd_utils {
   set_hdr_state(bool enable_hdr);
 
   bool
-  ensure_vdd_extended_mode(const std::string &device_id, const std::unordered_set<std::string> &physical_devices_to_preserve = {});
+  ensure_vdd_extended_mode(const std::string &device_id, const std::vector<std::string> &physical_devices_to_preserve = {});
 
   /**
    * @brief Apply VDD prep settings to handle physical displays.
    * @param vdd_device_id The VDD device ID.
    * @param vdd_prep The vdd_prep_e value specifying how to handle physical displays.
-   * @param pre_vdd_devices Physical device info captured BEFORE VDD creation.
-   *        Used to reliably identify physical displays even if VDD creation
-   *        caused them to become inactive. If empty, falls back to current device enumeration.
+   * @param pre_vdd_devices Physical device info captured before VDD creation.
+   *        An engaged empty map represents a headless host. An unengaged value
+   *        falls back to current device enumeration.
    * @returns True if the operation succeeded.
    * @note This operation modifies topology without saving/restoring state,
    *       as Windows automatically handles topology memory when displays change.
    */
   bool
   apply_vdd_prep(const std::string &vdd_device_id, parsed_config_t::vdd_prep_e vdd_prep,
-    const device_info_map_t &pre_vdd_devices = {});
+    const boost::optional<device_info_map_t> &pre_vdd_devices);
 
   VddSettings
   prepare_vdd_settings(const parsed_config_t &config);

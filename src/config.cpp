@@ -47,7 +47,7 @@ using namespace std::literals;
 #define PRIVATE_KEY_FILE CA_DIR "/cakey.pem"
 #define CERTIFICATE_FILE CA_DIR "/cacert.pem"
 
-#define APPS_JSON_PATH platf::appdata().string() + "/apps.json"
+#define APPS_JSON_PATH file_handler::path_to_utf8(platf::appdata() / "apps.json")
 namespace config {
 
   namespace {
@@ -474,8 +474,8 @@ namespace config {
     60,  // input_activity_boost_fps
     150,  // input_activity_boost_window_ms
     "balanced"s,  // downscaling_quality (default: bicubic for best quality/performance balance)
-    false,  // hdr_luminance_analysis (disabled by default to avoid GPU overhead)
-    "auto"s,  // capture_compute_shader (default: auto -> off until validated)
+    "auto"s,  // hdr_luminance_analysis (automatic for HDR streams, inactive for SDR)
+    "auto"s,  // capture_compute_shader (automatic capability and benefit detection)
     false,  // wgc_disable_secure_desktop (disabled by default for security)
     true,  // dynamic_resolution_follow_display (default: on; matches existing behavior. Set false for legacy clients like PSVita Moonlight.)
   };
@@ -528,13 +528,11 @@ namespace config {
     SLEEP_MODE_SUSPEND,  // sleep_mode: default to S3 suspend
 
     10,  // pair_max_attempts: default 10 attempts per IP per 60s
-  };
 
-  webhook_t webhook {
-    false,  // enabled
-    {},     // url
-    false,  // skip_ssl_verify
-    1000ms, // timeout
+    true,  // client_fingerprint_remote_rules
+    "https://raw.githubusercontent.com/AlkaidLab/sunshine-client-fingerprint-rules/main/stable.json",
+    {},  // client_fingerprint_rules_certificate (empty uses the pinned built-in certificate)
+    24,  // client_fingerprint_rules_refresh_hours
   };
 
   input_t input {
@@ -579,12 +577,12 @@ namespace config {
     {},  // Username
     {},  // Password
     {},  // Password Salt
-    platf::appdata().string() + "/sunshine.conf",  // config file
+    file_handler::path_to_utf8(platf::appdata() / "sunshine.conf"),  // config file
     {},  // cmd args
     47989,  // Base port number
     "ipv4",  // Address family
     {},  // Bind address
-    platf::appdata().string() + "/sunshine.log",  // log file
+    file_handler::path_to_utf8(platf::appdata() / "sunshine.log"),  // log file
     false,  // restore_log - 默认不恢复日志文件
     50,  // max_log_size_mb - 默认50MB，超过自动轮转
     false,  // notify_pre_releases
@@ -607,12 +605,39 @@ namespace config {
     return space_tab(ch) || endline(ch);
   }
 
+  template <class It>
+  It
+  find_comment(It begin, It end) {
+    bool quoted = false;
+    bool escaped = false;
+    for (auto pos = begin; pos != end; ++pos) {
+      if (quoted) {
+        if (escaped) {
+          escaped = false;
+        }
+        else if (*pos == '\\') {
+          escaped = true;
+        }
+        else if (*pos == '"') {
+          quoted = false;
+        }
+      }
+      else if (*pos == '"') {
+        quoted = true;
+      }
+      else if (*pos == '#') {
+        return pos;
+      }
+    }
+    return end;
+  }
+
   std::string
   to_string(const char *begin, const char *end) {
     std::string result;
 
     KITTY_WHILE_LOOP(auto pos = begin, pos != end, {
-      auto comment = std::find(pos, end, '#');
+      auto comment = find_comment(pos, end);
       auto endl = std::find_if(comment, end, endline);
 
       result.append(pos, comment);
@@ -627,11 +652,34 @@ namespace config {
   It
   skip_list(It skipper, It end) {
     int stack = 1;
+    bool quoted = false;
+    bool escaped = false;
+    bool comment = false;
     while (skipper != end && stack) {
-      if (*skipper == '[') {
+      if (comment) {
+        comment = !endline(*skipper);
+      }
+      else if (quoted) {
+        if (escaped) {
+          escaped = false;
+        }
+        else if (*skipper == '\\') {
+          escaped = true;
+        }
+        else if (*skipper == '"') {
+          quoted = false;
+        }
+      }
+      else if (*skipper == '"') {
+        quoted = true;
+      }
+      else if (*skipper == '#') {
+        comment = true;
+      }
+      else if (*skipper == '[') {
         ++stack;
       }
-      if (*skipper == ']') {
+      else if (*skipper == ']') {
         --stack;
       }
 
@@ -647,7 +695,7 @@ namespace config {
   parse_option(std::string_view::const_iterator begin, std::string_view::const_iterator end) {
     begin = std::find_if_not(begin, end, whitespace);
     auto endl = std::find_if(begin, end, endline);
-    auto endc = std::find(begin, endl, '#');
+    auto endc = find_comment(begin, endl);
     endc = std::find_if(std::make_reverse_iterator(endc), std::make_reverse_iterator(begin), std::not_fn(whitespace)).base();
 
     auto eq = std::find(begin, endc, '=');
@@ -751,7 +799,7 @@ namespace config {
     string_f(vars, name, temp);
 
     if (!temp.empty()) {
-      input = temp;
+      input = file_handler::path_from_utf8(temp);
     }
 
     if (input.is_relative()) {
@@ -769,11 +817,11 @@ namespace config {
 
   void
   path_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::string &input) {
-    fs::path temp = input;
+    fs::path temp = file_handler::path_from_utf8(input);
 
     path_f(vars, name, temp);
 
-    input = temp.string();
+    input = file_handler::path_to_utf8(temp);
   }
 
   void
@@ -1169,6 +1217,7 @@ namespace config {
     generic_f(vars, "nvenc_temporal_filter", video.nv.temporal_filter_level, nv::temporal_filter_level_from_view);
     generic_f(vars, "nvenc_rate_control", video.nv.rate_control_mode, nv::rate_control_mode_from_view);
     int_between_f(vars, "nvenc_target_quality", video.nv.target_quality, { 0, 63 });
+    bool_f(vars, "nvenc_cuda_array_input", video.nv.cuda_array_input);
     bool_f(vars, "nvenc_realtime_hags", video.nv_realtime_hags);
     bool_f(vars, "nvenc_opengl_vulkan_on_dxgi", video.nv_opengl_vulkan_on_dxgi);
     bool_f(vars, "nvenc_latency_over_power", video.nv_sunshine_high_power_mode);
@@ -1327,7 +1376,31 @@ namespace config {
     bool_f(vars, "input_activity_boost", video.input_activity_boost);
     int_between_f(vars, "input_activity_boost_fps", video.input_activity_boost_fps, { 0, 1000 });
     int_between_f(vars, "input_activity_boost_window_ms", video.input_activity_boost_window_ms, { 0, 5000 });
-    bool_f(vars, "hdr_luminance_analysis", video.hdr_luminance_analysis);
+    string_f(vars, "hdr_luminance_analysis", video.hdr_luminance_analysis);
+    if (video.hdr_luminance_analysis == "true" ||
+        video.hdr_luminance_analysis == "enabled" ||
+        video.hdr_luminance_analysis == "yes" ||
+        video.hdr_luminance_analysis == "enable" ||
+        video.hdr_luminance_analysis == "1") {
+      video.hdr_luminance_analysis = "on";
+    }
+    else if (video.hdr_luminance_analysis == "false" ||
+             video.hdr_luminance_analysis == "disabled" ||
+             video.hdr_luminance_analysis == "no" ||
+             video.hdr_luminance_analysis == "disable" ||
+             video.hdr_luminance_analysis == "0") {
+      video.hdr_luminance_analysis = "off";
+    }
+    if (video.hdr_luminance_analysis.empty()) {
+      video.hdr_luminance_analysis = "auto";
+    }
+    if (video.hdr_luminance_analysis != "auto" &&
+        video.hdr_luminance_analysis != "on" &&
+        video.hdr_luminance_analysis != "off") {
+      BOOST_LOG(warning) << "Invalid hdr_luminance_analysis: ["sv << video.hdr_luminance_analysis
+                         << "], valid options are: auto, on, off. Defaulting to 'auto'"sv;
+      video.hdr_luminance_analysis = "auto";
+    }
     bool_f(vars, "wgc_disable_secure_desktop", video.wgc_disable_secure_desktop);
     bool_f(vars, "dynamic_resolution_follow_display", video.dynamic_resolution_follow_display);
     bool_f(vars, "vdd_keep_enabled", video.vdd_keep_enabled);
@@ -1388,6 +1461,22 @@ namespace config {
     list_string_f(vars, "fps"s, nvhttp.fps);
     int_between_f(vars, "sleep_mode", nvhttp.sleep_mode, { SLEEP_MODE_SUSPEND, SLEEP_MODE_AWAY });
     int_between_f(vars, "pair_max_attempts", nvhttp.pair_max_attempts, { 0, 50 });
+    bool_f(vars, "client_fingerprint_remote_rules", nvhttp.client_fingerprint_remote_rules);
+    string_f(vars, "client_fingerprint_rules_url", nvhttp.client_fingerprint_rules_url);
+    string_f(vars, "client_fingerprint_rules_certificate", nvhttp.client_fingerprint_rules_certificate);
+    if (!nvhttp.client_fingerprint_rules_certificate.empty()) {
+      auto certificate_path = file_handler::path_from_utf8(nvhttp.client_fingerprint_rules_certificate);
+      if (certificate_path.is_relative()) {
+        certificate_path = platf::appdata() / certificate_path;
+      }
+      nvhttp.client_fingerprint_rules_certificate = file_handler::path_to_utf8(certificate_path);
+    }
+    int_between_f(
+      vars,
+      "client_fingerprint_rules_refresh_hours",
+      nvhttp.client_fingerprint_rules_refresh_hours,
+      {1, 168}
+    );
     list_prep_cmd_f(vars, "global_prep_cmd", config::sunshine.prep_cmds);
 
     string_f(vars, "audio_sink", audio.sink);
@@ -1410,10 +1499,12 @@ namespace config {
     path_f(vars, "file_apps", stream.file_apps);
 #ifndef __ANDROID__
     // TODO: Android can possibly support this
-    if (!fs::exists(stream.file_apps.c_str())) {
-      fs::copy_file(SUNSHINE_ASSETS_DIR "/apps.json", stream.file_apps);
+    const auto file_apps_path = file_handler::path_from_utf8(stream.file_apps);
+    if (!fs::exists(file_apps_path)) {
+      const auto bundled_apps_path = file_handler::path_from_utf8(SUNSHINE_ASSETS_DIR "/apps.json");
+      fs::copy_file(bundled_apps_path, file_apps_path);
       fs::permissions(
-        stream.file_apps,
+        file_apps_path,
         fs::perms::owner_read | fs::perms::owner_write,
         fs::perm_options::add
       );
@@ -1513,15 +1604,6 @@ namespace config {
     if (sunshine.max_log_size_mb < 0) {
       sunshine.max_log_size_mb = 0;
     }
-
-    // Webhook configuration
-    bool_f(vars, "webhook_enabled"s, webhook.enabled);
-    string_f(vars, "webhook_url"s, webhook.url);
-    bool_f(vars, "webhook_skip_ssl_verify"s, webhook.skip_ssl_verify);
-    
-    int webhook_timeout = 1000;
-    int_between_f(vars, "webhook_timeout"s, webhook_timeout, { 100, 5000 });
-    webhook.timeout = std::chrono::milliseconds(webhook_timeout);
 
     string_restricted_f(vars, "locale", config::sunshine.locale, {
                                                                    "bg"sv,  // Bulgarian
@@ -1662,11 +1744,12 @@ namespace config {
     bool config_loaded = false;
     try {
       // Create appdata folder if it does not exist
-      file_handler::make_directory(platf::appdata().string());
+      file_handler::make_directory(file_handler::path_to_utf8(platf::appdata()));
 
       // Create empty config file if it does not exist
-      if (!fs::exists(sunshine.config_file)) {
-        std::ofstream { sunshine.config_file };
+      const auto config_path = file_handler::path_from_utf8(sunshine.config_file);
+      if (!fs::exists(config_path)) {
+        std::ofstream { config_path };
       }
 
       // Read config file
@@ -1803,7 +1886,10 @@ namespace config {
         }
       }
 
-      file_handler::write_file(sunshine.config_file.c_str(), configStream.str());
+      if (file_handler::write_file(sunshine.config_file.c_str(), configStream.str()) != 0) {
+        BOOST_LOG(warning) << "Failed to write config file: " << sunshine.config_file;
+        return false;
+      }
       BOOST_LOG(info) << "Config updated successfully";
       return true;
     }
@@ -1881,17 +1967,62 @@ namespace config {
         for (const auto &[key, value] : resultMap) {
           configStream << key << " = " << value << std::endl;
         }
-        file_handler::write_file(sunshine.config_file.c_str(), configStream.str());
+        if (file_handler::write_file(sunshine.config_file.c_str(), configStream.str()) != 0) {
+          BOOST_LOG(warning) << "Failed to write config file: " << sunshine.config_file;
+          return false;
+        }
         BOOST_LOG(info) << "Config saved successfully";
-        return true;
       }
       else {
         BOOST_LOG(info) << "Config unchanged, skip writing";
-        return false;
       }
+
+      return true;
     }
     catch (const std::exception &e) {
       BOOST_LOG(warning) << "Failed to save config: " << e.what();
+      return false;
+    }
+  }
+
+  std::string
+  get_clients_config() {
+    std::lock_guard lock { config_file_mutex };
+    return nvhttp.clients;
+  }
+
+  bool
+  save_clients_config(const std::string &clients) {
+    std::lock_guard lock { config_file_mutex };
+    try {
+      const auto normalized_clients = nlohmann::json::parse(clients).dump();
+      std::map<std::string, std::string> config_map;
+      const auto file_content = file_handler::read_file(sunshine.config_file.c_str());
+      const auto existing_config = parse_config(file_content);
+      config_map.insert(existing_config.begin(), existing_config.end());
+
+      const auto existing = config_map.find("clients");
+      if (existing == config_map.end() || existing->second != normalized_clients) {
+        config_map["clients"] = normalized_clients;
+
+        std::stringstream config_stream;
+        for (const auto &[key, value] : config_map) {
+          if (!value.empty() && value != "null") {
+            config_stream << key << " = " << value << std::endl;
+          }
+        }
+
+        if (file_handler::write_file(sunshine.config_file.c_str(), config_stream.str()) != 0) {
+          BOOST_LOG(warning) << "Failed to write client settings to config file: " << sunshine.config_file;
+          return false;
+        }
+      }
+
+      nvhttp.clients = normalized_clients;
+      return true;
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(warning) << "Failed to save client settings: " << e.what();
       return false;
     }
   }

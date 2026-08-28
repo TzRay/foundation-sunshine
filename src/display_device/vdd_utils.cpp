@@ -5,6 +5,7 @@
 #include "vdd_ioctl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/process/v1.hpp>
@@ -48,6 +49,73 @@ namespace display_device {
     // 上一次使用的客户端UUID，用于在没有提供UUID时使用
     static std::string last_used_client_uuid;
 
+    namespace {
+      constexpr auto kModePublicationTimeout = 3s;
+      constexpr auto kModePublicationInitialPoll = 50ms;
+      constexpr auto kModePublicationMaxPoll = 500ms;
+      std::atomic_bool hardware_cursor_live_enable_confirmed { false };
+
+      bool
+      orientation_swaps_axes(DWORD orientation) {
+        return orientation == DMDO_90 || orientation == DMDO_270;
+      }
+
+      unsigned int
+      orientation_degrees(DWORD orientation) {
+        switch (orientation) {
+          case DMDO_90:
+            return 90;
+          case DMDO_180:
+            return 180;
+          case DMDO_270:
+            return 270;
+          case DMDO_DEFAULT:
+          default:
+            return 0;
+        }
+      }
+
+      std::vector<std::string>
+      collect_physical_devices_for_preservation() {
+        const auto topology = get_current_topology();
+        const auto devices = enum_available_devices();
+        std::vector<std::string> ordered_devices;
+        std::unordered_set<std::string> included;
+
+        const auto append = [&](const std::string &device_id) {
+          const auto device_it = devices.find(device_id);
+          const auto friendly_name = device_it != devices.end() ?
+                                       device_it->second.friendly_name :
+                                       get_display_friendly_name(device_id);
+          if (friendly_name != ZAKO_NAME && included.insert(device_id).second) {
+            ordered_devices.push_back(device_id);
+          }
+        };
+
+        // Active topology order preserves the current primary display first.
+        for (const auto &group : topology) {
+          for (const auto &device_id : group) {
+            append(device_id);
+          }
+        }
+
+        if (ordered_devices.empty()) {
+          // If no topology is active, preserve the enumerated primary first,
+          // followed by the remaining physical displays.
+          for (const auto &[device_id, device_info] : devices) {
+            if (device_info.device_state == device_state_e::primary) {
+              append(device_id);
+            }
+          }
+          for (const auto &entry : devices) {
+            append(entry.first);
+          }
+        }
+
+        return ordered_devices;
+      }
+    }  // namespace
+
     vdd_status_t
     get_vdd_status() {
       vdd_status_t status;
@@ -75,62 +143,35 @@ namespace display_device {
       return std::min(delay, kMaxRetryDelay);
     }
 
-    /**
-     * @brief Allowed DevManView actions for VDD driver management.
-     */
-    enum class vdd_action_e {
-      enable,
-      disable,
-      disable_enable
-    };
-
-    /**
-     * @brief Get the command-line argument string for a VDD action.
-     */
-    const char *
-    vdd_action_to_string(vdd_action_e action) {
-      switch (action) {
-        case vdd_action_e::enable: return "enable";
-        case vdd_action_e::disable: return "disable";
-        case vdd_action_e::disable_enable: return "disable_enable";
-        default: return nullptr;
-      }
-    }
-
     bool
-    execute_vdd_command(vdd_action_e action) {
+    execute_vdd_disable_enable_command() {
       static const std::string kDevManPath = (std::filesystem::path(SUNSHINE_ASSETS_DIR).parent_path() / "tools" / "DevManView.exe").string();
       static const std::string kDriverName = "Zako Display Adapter";
-
-      const char *action_str = vdd_action_to_string(action);
-      if (!action_str) {
-        BOOST_LOG(error) << "未知的VDD命令操作";
-        return false;
-      }
+      static constexpr auto kAction = "disable_enable";
 
       boost::process::v1::environment _env = boost::this_process::environment();
       auto working_dir = boost::filesystem::path();
       std::error_code ec;
 
-      std::string cmd = kDevManPath + " /" + action_str + " \"" + kDriverName + "\"";
+      std::string cmd = kDevManPath + " /" + kAction + " \"" + kDriverName + "\"";
 
       for (int attempt = 0; attempt < kMaxRetryCount; ++attempt) {
         auto child = platf::run_command(true, true, cmd, working_dir, _env, nullptr, ec, nullptr);
         if (!ec) {
-          BOOST_LOG(info) << "成功执行VDD " << action_str << " 命令";
+          BOOST_LOG(info) << "成功执行VDD " << kAction << " 命令";
           child.detach();
           return true;
         }
 
         auto delay = calculate_exponential_backoff(attempt);
-        BOOST_LOG(warning) << "执行VDD " << action_str << " 命令失败 (尝试 "
+        BOOST_LOG(warning) << "执行VDD " << kAction << " 命令失败 (尝试 "
                            << (attempt + 1) << "/" << kMaxRetryCount
                            << "): " << ec.message() << ". 将在 "
                            << delay.count() << "ms 后重试";
         std::this_thread::sleep_for(delay);
       }
 
-      BOOST_LOG(error) << "执行VDD " << action_str << " 命令失败，已达到最大重试次数";
+      BOOST_LOG(error) << "执行VDD " << kAction << " 命令失败，已达到最大重试次数";
       return false;
     }
 
@@ -175,13 +216,19 @@ namespace display_device {
     }
 
     bool
-    ensure_hardware_cursor_disabled_for_capture(bool *changed) {
+    hardware_cursor_export_enabled(std::string value) {
+      boost::algorithm::trim(value);
+      return boost::algorithm::iequals(value, "true") || value == "1";
+    }
+
+    bool
+    ensure_hardware_cursor_enabled_for_capture(bool *changed) {
       if (changed) {
         *changed = false;
       }
 
       const auto settings_path = std::filesystem::path(platf::appdata()) / "vdd_settings.xml";
-      bool needs_disable = true;
+      bool persisted_enabled = false;
 
       try {
         if (std::filesystem::exists(settings_path)) {
@@ -189,41 +236,49 @@ namespace display_device {
           pt::read_xml(settings_path.string(), tree);
 
           if (const auto value = tree.get_optional<std::string>("vdd_settings.cursor.HardwareCursor")) {
-            auto hardware_cursor = *value;
-            boost::algorithm::trim(hardware_cursor);
-            needs_disable = !(boost::algorithm::iequals(hardware_cursor, "false") || hardware_cursor == "0");
+            persisted_enabled = hardware_cursor_export_enabled(*value);
           }
         }
       }
       catch (const std::exception &e) {
-        BOOST_LOG(warning) << "Unable to inspect VDD HardwareCursor setting; will request software cursor for direct capture: " << e.what();
+        BOOST_LOG(warning) << "Unable to inspect VDD HardwareCursor setting; will request cursor export for direct capture: " << e.what();
       }
 
-      if (!needs_disable) {
-        BOOST_LOG(debug) << "VDD HardwareCursor is already disabled for direct capture";
+      if (!hardware_cursor_export_needs_enable(
+            persisted_enabled,
+            hardware_cursor_live_enable_confirmed.load(std::memory_order_acquire))) {
+        BOOST_LOG(debug) << "VDD hardware cursor export is enabled in settings and confirmed by the live driver";
         return true;
       }
 
-      BOOST_LOG(info) << "Disabling VDD HardwareCursor because direct VDD capture only receives the shared framebuffer texture";
-      if (!set_hardware_cursor_enabled(false)) {
-        return false;
-      }
+      BOOST_LOG(info) << "Enabling VDD hardware cursor export for direct capture";
+      bool persisted = persisted_enabled;
+      if (!persisted) {
+        for (int attempt = 0; attempt < kMaxRetryCount; ++attempt) {
+          if (persist_hardware_cursor_setting(true)) {
+            persisted = true;
+            break;
+          }
 
-      bool persisted = false;
-      for (int attempt = 0; attempt < kMaxRetryCount; ++attempt) {
-        if (persist_hardware_cursor_setting(false)) {
-          persisted = true;
-          break;
+          std::this_thread::sleep_for(calculate_exponential_backoff(attempt));
         }
-
-        std::this_thread::sleep_for(calculate_exponential_backoff(attempt));
       }
 
       if (!persisted) {
-        BOOST_LOG(error) << "VDD HardwareCursor disabled in driver, but failed to persist vdd_settings.xml";
+        BOOST_LOG(error) << "Failed to persist VDD hardware cursor export before reloading the driver";
         return false;
       }
 
+      // The VDD command reloads the driver synchronously and the driver reads
+      // HardwareCursor from this file during reload. Persist first so it cannot
+      // observe the old value and keep cursor export disabled in memory.
+      if (!set_hardware_cursor_enabled(true)) {
+        hardware_cursor_live_enable_confirmed.store(false, std::memory_order_release);
+        BOOST_LOG(error) << "VDD hardware cursor export is persisted, but the live driver reload failed";
+        return false;
+      }
+
+      hardware_cursor_live_enable_confirmed.store(true, std::memory_order_release);
       if (changed) {
         *changed = true;
       }
@@ -425,7 +480,7 @@ namespace display_device {
 
       try {
         pt::ptree clientArray;
-        std::stringstream ss(config::nvhttp.clients);
+        std::stringstream ss(config::get_clients_config());
         pt::read_json(ss, clientArray);
 
         for (const auto &client : clientArray) {
@@ -554,18 +609,8 @@ namespace display_device {
     }
 
     void
-    enable_vdd() {
-      execute_vdd_command(vdd_action_e::enable);
-    }
-
-    void
-    disable_vdd() {
-      execute_vdd_command(vdd_action_e::disable);
-    }
-
-    void
     disable_enable_vdd() {
-      execute_vdd_command(vdd_action_e::disable_enable);
+      execute_vdd_disable_enable_command();
     }
 
     bool
@@ -575,24 +620,7 @@ namespace display_device {
 
     bool
     create_vdd_monitor_noninteractive() {
-      std::unordered_set<std::string> physical_devices_before;
-      const auto topology_before = get_current_topology();
-      const auto all_devices_before = enum_available_devices();
-
-      for (const auto &group : topology_before) {
-        for (const auto &device_id : group) {
-          if (get_display_friendly_name(device_id) != ZAKO_NAME) {
-            physical_devices_before.insert(device_id);
-          }
-        }
-      }
-      if (physical_devices_before.empty()) {
-        for (const auto &[device_id, device_info] : all_devices_before) {
-          if (get_display_friendly_name(device_id) != ZAKO_NAME) {
-            physical_devices_before.insert(device_id);
-          }
-        }
-      }
+      const auto physical_devices_before = collect_physical_devices_for_preservation();
 
       if (!create_vdd_monitor("", hdr_brightness_t {}, physical_size_t {})) {
         return false;
@@ -649,28 +677,7 @@ namespace display_device {
 
       // 保存创建虚拟显示器前的物理设备列表
       // 同时从所有可用设备中查找物理显示器（包括可能被禁用的）
-      std::unordered_set<std::string> physical_devices_before;
-      auto topology_before = get_current_topology();
-      auto all_devices_before = enum_available_devices();
-
-      // 从当前拓扑中获取活动的物理设备
-      for (const auto &group : topology_before) {
-        for (const auto &device_id : group) {
-          if (get_display_friendly_name(device_id) != ZAKO_NAME) {
-            physical_devices_before.insert(device_id);
-          }
-        }
-      }
-
-      // 如果拓扑中没有物理设备，尝试从所有设备中查找（可能被禁用了）
-      if (physical_devices_before.empty()) {
-        for (const auto &[device_id, device_info] : all_devices_before) {
-          if (get_display_friendly_name(device_id) != ZAKO_NAME) {
-            physical_devices_before.insert(device_id);
-            BOOST_LOG(debug) << "从所有设备中找到物理显示器: " << device_id;
-          }
-        }
-      }
+      const auto physical_devices_before = collect_physical_devices_for_preservation();
 
       // 后台线程确保VDD处于扩展模式，并进行二次确认
       std::thread([vdd_device_id = find_device_by_friendlyname(ZAKO_NAME), physical_devices_before]() mutable {
@@ -770,6 +777,13 @@ namespace display_device {
 
       const auto &display_name = device_it->second.display_name;
       const std::wstring wide_display_name(display_name.begin(), display_name.end());
+      DEVMODEW current_mode {};
+      current_mode.dmSize = sizeof(current_mode);
+      const bool orientation_known =
+        EnumDisplaySettingsW(wide_display_name.c_str(), ENUM_CURRENT_SETTINGS, &current_mode) &&
+        (current_mode.dmFields & DM_DISPLAYORIENTATION) != 0;
+      const bool swaps_axes = orientation_known && orientation_swaps_axes(current_mode.dmDisplayOrientation);
+
       for (DWORD index = 0; index < 4096; ++index) {
         DEVMODEW mode {};
         mode.dmSize = sizeof(mode);
@@ -777,11 +791,20 @@ namespace display_device {
           break;
         }
 
-        if (advertised_mode_matches(
-              mode.dmPelsWidth,
-              mode.dmPelsHeight,
-              mode.dmDisplayFrequency,
-              requested_mode)) {
+        const auto match = classify_advertised_mode(
+          mode.dmPelsWidth,
+          mode.dmPelsHeight,
+          mode.dmDisplayFrequency,
+          requested_mode,
+          swaps_axes);
+        if (match == advertised_mode_match_e::rotation_equivalent) {
+          BOOST_LOG(info) << "VDD mode "
+                          << requested_mode.resolution.width << 'x' << requested_mode.resolution.height
+                          << " is available through the current "
+                          << orientation_degrees(current_mode.dmDisplayOrientation)
+                          << "-degree display orientation; reusing the existing monitor";
+        }
+        if (match != advertised_mode_match_e::none) {
           return true;
         }
       }
@@ -790,16 +813,34 @@ namespace display_device {
     }
 
     bool
-    ensure_vdd_extended_mode(const std::string &device_id, const std::unordered_set<std::string> &physical_devices_to_preserve) {
+    wait_for_mode_publication(const std::string &device_id, const display_mode_t &requested_mode) {
+      const auto deadline = std::chrono::steady_clock::now() + kModePublicationTimeout;
+      auto poll_delay = kModePublicationInitialPoll;
+
+      while (true) {
+        if (is_mode_advertised(device_id, requested_mode)) {
+          return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+          return false;
+        }
+
+        std::this_thread::sleep_for(std::min(
+          poll_delay,
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+        poll_delay = std::min(kModePublicationMaxPoll, poll_delay * 2);
+      }
+    }
+
+    bool
+    ensure_vdd_extended_mode(const std::string &device_id, const std::vector<std::string> &physical_devices_to_preserve) {
       if (device_id.empty()) {
         return false;
       }
 
       auto current_topology = get_current_topology();
-      if (current_topology.empty()) {
-        BOOST_LOG(warning) << "无法获取当前显示器拓扑";
-        return false;
-      }
 
       // 查找VDD所在的拓扑组
       std::size_t vdd_group_index = SIZE_MAX;
@@ -810,13 +851,39 @@ namespace display_device {
         }
       }
 
+      if (vdd_group_index == SIZE_MAX) {
+        // A cold-created IDDCX monitor can be available to DisplayConfig while
+        // remaining absent from the active topology (and therefore have no
+        // \\.\DISPLAYn name). Add it as an independent extended display.
+        active_topology_t new_topology = current_topology;
+        std::unordered_set<std::string> included;
+        for (const auto &group : new_topology) {
+          included.insert(group.begin(), group.end());
+        }
+
+        for (const auto &physical_id : physical_devices_to_preserve) {
+          if (physical_id != device_id && included.insert(physical_id).second) {
+            new_topology.push_back({ physical_id });
+          }
+        }
+        new_topology.push_back({ device_id });
+
+        if (!is_topology_valid(new_topology) || !set_topology(new_topology)) {
+          BOOST_LOG(error) << "Failed to add inactive VDD to the extended topology";
+          return false;
+        }
+
+        BOOST_LOG(info) << "Added inactive VDD to the extended topology";
+        return true;
+      }
+
       // 检查是否需要切换
-      bool is_duplicated = (vdd_group_index != SIZE_MAX && current_topology[vdd_group_index].size() > 1);
+      bool is_duplicated = current_topology[vdd_group_index].size() > 1;
       bool is_vdd_only = (current_topology.size() == 1 && current_topology[0].size() == 1 && current_topology[0][0] == device_id);
 
       if (!is_duplicated && !is_vdd_only) {
         BOOST_LOG(debug) << "VDD已经是扩展模式";
-        return false;
+        return true;
       }
 
       BOOST_LOG(info) << "检测到VDD处于" << (is_vdd_only ? "仅启用" : "复制") << "模式，切换到扩展模式";
@@ -901,7 +968,7 @@ namespace display_device {
 
     bool
     apply_vdd_prep(const std::string &vdd_device_id, parsed_config_t::vdd_prep_e vdd_prep,
-      const device_info_map_t &pre_vdd_devices) {
+      const boost::optional<device_info_map_t> &pre_vdd_devices) {
       if (vdd_device_id.empty()) {
         BOOST_LOG(info) << "VDD设备ID为空，跳过vdd_prep处理";
         return true;
@@ -922,9 +989,9 @@ namespace display_device {
                 info.device_state == device_state_e::primary);
       };
 
-      if (!pre_vdd_devices.empty()) {
+      if (pre_vdd_devices) {
         // 使用 VDD 创建前保存的设备信息（可靠）
-        for (const auto &[device_id, info] : pre_vdd_devices) {
+        for (const auto &[device_id, info] : *pre_vdd_devices) {
           if (is_active_physical_display(info)) {
             physical_devices.push_back(device_id);
             if (info.device_state == device_state_e::primary) {
@@ -958,8 +1025,9 @@ namespace display_device {
       }
 
       if (physical_devices.empty()) {
-        BOOST_LOG(debug) << "没有物理显示器需要处理";
-        return true;
+        // Continue building a VDD-only topology. This is required on headless
+        // systems where a cold-created monitor is not activated automatically.
+        BOOST_LOG(debug) << "No physical displays to preserve; activating a VDD-only topology";
       }
 
       active_topology_t new_topology;
@@ -1006,12 +1074,16 @@ namespace display_device {
         return false;
       }
 
-      if (!set_topology(new_topology)) {
+      BOOST_LOG(info) << "vdd_prep 目标拓扑: " << to_string(new_topology);
+
+      const bool topology_applied = set_topology(new_topology);
+      if (!topology_applied) {
         BOOST_LOG(error) << "设置拓扑失败";
         return false;
       }
 
       BOOST_LOG(info) << "成功应用vdd_prep设置";
+      BOOST_LOG(debug) << "vdd_prep 执行后显示设备: " << to_string(enum_available_devices());
       return true;
     }
   }  // namespace vdd_utils

@@ -1,8 +1,6 @@
 name: Build and Release
 
-# Published releases are owned by sign-and-repackage.yml. Keeping that event
-# out of this workflow prevents a release created below from starting another
-# build-and-release cycle.
+# Fork 构建只上传 Actions 产物，不触发正式版本的签名流水线。
 on:
   pull_request:
     branches:
@@ -20,10 +18,6 @@ concurrency:
   group: '${{ github.workflow }}-${{ github.ref }}'
   cancel-in-progress: true
 
-# Opt all Node.js 20 actions onto the Node.js 24 runtime. GitHub will
-# eventually flip this default itself; setting it explicitly silences the
-# `actions/checkout@v4` deprecation warning emitted on every run and keeps
-# us forward-compatible with the September 2026 Node 20 removal.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -31,12 +25,8 @@ jobs:
   setup_release:
     name: Setup Build Metadata
     outputs:
-      publish_release: ${{ steps.setup_build.outputs.publish_release }}
-      release_body: ${{ steps.setup_build.outputs.release_body }}
       release_commit: ${{ steps.setup_build.outputs.release_commit }}
-      release_generate_release_notes: ${{ steps.setup_build.outputs.release_generate_release_notes }}
       release_tag: ${{ steps.setup_build.outputs.release_tag }}
-      release_version: ${{ steps.setup_build.outputs.release_version }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -45,17 +35,23 @@ jobs:
         id: setup_build
         shell: bash
         run: |
-          SUFFIX=$([ "${{ github.ref_name }}" = "master" ] && echo "" || echo "-dev")
-          BUILD_KIND=$([ "${{ github.event_name }}" = "workflow_dispatch" ] && echo "manual" || echo "ci")
-          BUILD_TAG="${BUILD_KIND}-$(date +%Y%m%d-%H%M%S)-${{ github.run_number }}${SUFFIX}"
-
+          BUILD_TAG="fork-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "正在生成独立于上游仓库合并策略的构建元数据。"
-          echo "publish_release=false" >> $GITHUB_OUTPUT
-          echo "release_body=流水线构建 (${{ github.ref_name }})" >> $GITHUB_OUTPUT
-          echo "release_commit=${{ github.sha }}" >> $GITHUB_OUTPUT
-          echo "release_generate_release_notes=false" >> $GITHUB_OUTPUT
-          echo "release_tag=${BUILD_TAG}" >> $GITHUB_OUTPUT
-          echo "release_version=${BUILD_TAG}" >> $GITHUB_OUTPUT
+          echo "release_commit=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${BUILD_TAG}" >> "$GITHUB_OUTPUT"
+
+  vdd_smoke:
+    name: VDD helper smoke tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run VDD helper smoke tests
+        shell: pwsh
+        run: |
+          & .\src_assets\windows\misc\vdd\smoke-test-vdd-device-helper.ps1
+          & .\src_assets\windows\misc\vdd\smoke-test-install-vdd-selection.ps1
 
   build_win:
     name: Windows
@@ -63,7 +59,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           submodules: recursive
@@ -72,6 +68,12 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: ucrt64
+          # Required, not redundant with the `pacman -Syu` below. When
+          # msys2-runtime itself needs upgrading, pacman closes every MSYS2
+          # process to finish the job, which kills the workflow shell and fails
+          # the step with exit 1. setup-msys2 performs that upgrade with the
+          # restart it needs; by the time our own step runs, the runtime is
+          # already current and only the dependency list is left to install.
           update: true
           install: >-
             wget
@@ -94,6 +96,7 @@ jobs:
           # Let pacman install the full toolchain at the current upstream version.
           dependencies=(
             "git"
+            "mingw-w64-ucrt-x86_64-ccache"
             "mingw-w64-ucrt-x86_64-cmake"
             "mingw-w64-ucrt-x86_64-ninja"
             "mingw-w64-ucrt-x86_64-cppwinrt"
@@ -129,21 +132,49 @@ jobs:
           echo "  GCC: $(gcc --version | head -1)"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: package-lock.json
+
+      - name: Setup .NET for DualSense sidecar
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build self-contained DualSense sidecar
+        shell: pwsh
+        run: |
+          # 编译 Sidecar 验证源码；安装包使用与当前上游基线匹配的官方固定组件。
+          .\scripts\build-ds5-sidecar.ps1
+          .\scripts\write-pinned-ds5-manifest.ps1
+
+      - name: 验证 Fork 打包规则
+        shell: pwsh
+        run: .\scripts\test-fork-packaging.ps1
 
       - name: Build Web UI
         shell: pwsh
         run: |
           npm ci
+          npm run lint:webui
           npm run test:webui
           New-Item -ItemType Directory -Force -Path build | Out-Null
           $env:SUNSHINE_SOURCE_ASSETS_DIR = "${{ github.workspace }}\src_assets"
           $env:SUNSHINE_ASSETS_DIR = "${{ github.workspace }}\build"
           npm run build
+
+      - name: Cache compiler objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}\.ccache
+          # The key must be unique per run for the cache to be written at all,
+          # so the prefix restore-key is what actually produces the hits: every
+          # run seeds itself from the most recent previous one.
+          key: ccache-windows-${{ github.run_id }}
+          restore-keys: |
+            ccache-windows-
 
       - name: Build Windows
         shell: msys2 {0}
@@ -152,30 +183,42 @@ jobs:
           BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
           COMMIT: ${{ needs.setup_release.outputs.release_commit }}
           GITHUB_TOKEN: ${{ secrets.DRIVER_DOWNLOAD_TOKEN }}
+          # ccache.exe is a native binary, so it reads the Windows-style path
+          # straight out of the environment even under the msys2 shell.
+          CCACHE_DIR: ${{ github.workspace }}\.ccache
+          CCACHE_MAXSIZE: 2G
+          # `pacman -Syu` can move the toolchain underneath us between runs.
+          # Hashing the compiler binary instead of its mtime keeps the cache
+          # valid across runs that did not actually change gcc.
+          CCACHE_COMPILERCHECK: content
         run: |
           mkdir -p build
-
+          ccache --zero-stats
           driver_deps_required=ON
           if [ -z "${GITHUB_TOKEN}" ]; then
             driver_deps_required=OFF
             echo "未配置 DRIVER_DOWNLOAD_TOKEN，缺失的私有驱动依赖将降级为警告。"
-          else
-            echo "已配置 DRIVER_DOWNLOAD_TOKEN，驱动依赖缺失将按错误处理。"
           fi
-
           cmake \
             -B build \
             -G Ninja \
             -S . \
             -DBUILD_DOCS=OFF \
+            -DBUILD_TESTS=ON \
             -DBUILD_TRAY_TESTS=ON \
             -DBUILD_WEB_UI=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DSUNSHINE_ASSETS_DIR=assets \
             -DDRIVER_DEPS_REQUIRED=${driver_deps_required} \
             -DSUNSHINE_PUBLISHER_NAME='${{ github.repository_owner }}' \
-            -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/AlkaidLab/foundation-sunshine' \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/AlkaidLab/foundation-sunshine/issues'
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues"
           ninja -C build
+
+          # Printed so a run that suddenly gets slow can be diagnosed as a cache
+          # miss rather than guessed at.
+          ccache --show-stats
 
       - name: Run native tests
         shell: msys2 {0}
@@ -183,7 +226,7 @@ jobs:
 
       - name: Cache Inno Setup
         id: inno-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: C:\Program Files (x86)\Inno Setup 6
           key: inno-setup-6
@@ -225,6 +268,7 @@ jobs:
               $process = Start-Process `
                 -FilePath $installer `
                 -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' `
+                -WindowStyle Hidden `
                 -PassThru `
                 -Wait
               if ($process.ExitCode -ne 0) {
@@ -264,18 +308,29 @@ jobs:
       - name: Package Windows
         shell: msys2 {0}
         run: |
+          set -o pipefail
           mkdir -p artifacts
           cd build
 
           # Package the Inno Setup installer and portable ZIP.
           # Install into the staging directory first.
           cmake --install . --prefix ./inno_staging
+          test -f ./inno_staging/tools/ds5-sidecar-package.json
+          test ! -e ./inno_staging/tools/sunshine-ds5-sidecar/Sunshine.Ds5Sidecar.exe
           
-          # Run the Inno Setup compiler.
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss
+          # Run the Inno Setup compiler and prove that it consumed only the
+          # lightweight package manifest, not the self-contained runtime.
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss | tee inno-build.log
+          grep -F "ds5-sidecar-package.json" inno-build.log
           
           # Generate the portable ZIP.
           cpack -G ZIP --config ./CPackConfig.cmake --verbose
+          cmake -E tar tf ./cpack_artifacts/Sunshine.zip | tr '\\' '/' > portable-files.txt
+          grep -F "Sunshine/tools/ds5-sidecar-package.json" portable-files.txt
+          if grep -F "Sunshine/tools/sunshine-ds5-sidecar/Sunshine.Ds5Sidecar.exe" portable-files.txt; then
+            echo "The optional DualSense runtime leaked into the main portable package"
+            exit 1
+          fi
 
           # move
           mv ./cpack_artifacts/Sunshine.exe ../artifacts/sunshine-windows-installer.exe
@@ -296,8 +351,21 @@ jobs:
           fi
 
           # 重命名安装包和便携版
-          mv artifacts/sunshine-windows-installer.exe "artifacts/Sunshine.${NEWTAG}.WindowsInstaller.exe"
-          mv artifacts/sunshine-windows-portable.zip "artifacts/Sunshine.${NEWTAG}.WindowsPortable.zip"
+          INSTALLER_NAME="Sunshine.${NEWTAG}.WindowsInstaller.exe"
+          mv artifacts/sunshine-windows-installer.exe "artifacts/${INSTALLER_NAME}"
+          mv artifacts/sunshine-windows-portable.zip "artifacts/Sunshine.${NEWTAG}.Portable-x64.zip"
+
+          # Legacy Control Panel builds treat any release asset containing
+          # "Windows" as a full installer. Keep that marker exclusive to the
+          # actual installer so existing users can update to the fixed build.
+          for asset in artifacts/*; do
+            name=$(basename "$asset")
+            lower=${name,,}
+            if [[ "$lower" == *windows* && "$lower" != "${INSTALLER_NAME,,}" ]]; then
+              echo "Non-installer release asset would confuse legacy updaters: $name"
+              exit 1
+            fi
+          done
 
       - name: Generate Checksums
         shell: pwsh
@@ -305,38 +373,13 @@ jobs:
           # 使用最终发布文件名生成校验清单，确保用户可以直接执行校验命令。
           .\scripts\generate-checksums.ps1 -Path .\artifacts -Output "SHA256SUMS.txt"
 
-      - name: Package Windows Debug Info
-        working-directory: build
-        run: |
-          # use .dbg file extension for binaries to avoid confusion with real packages
-          Get-ChildItem -File -Recurse | `
-            % { Rename-Item -Path $_.PSPath -NewName $_.Name.Replace(".exe",".dbg") }
-
-          # save the binaries with debug info
-          7z -r `
-            "-xr!CMakeFiles" `
-            "-xr!cpack_artifacts" `
-            a "../artifacts/sunshine-win32-debuginfo.7z" "*.dbg"
-
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sunshine-windows-r${{ github.run_number }}
           path: |
             artifacts/Sunshine.*.WindowsInstaller.exe
-            artifacts/Sunshine.*.WindowsPortable.zip
+            artifacts/Sunshine.*.Portable-x64.zip
             artifacts/SHA256SUMS.txt
             artifacts/checksums.json
           if-no-files-found: error
-
-      - name: Create/Update GitHub Release
-        if: needs.setup_release.outputs.publish_release == 'true'
-        uses: LizardByte/create-release-action@v2025.426.1549
-        with:
-          allowUpdates: true
-          body: ${{ needs.setup_release.outputs.release_body }}
-          generateReleaseNotes: ${{ needs.setup_release.outputs.release_generate_release_notes }}
-          name: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
-          prerelease: true
-          tag: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
-          token: ${{ secrets.GH_BOT_TOKEN }}

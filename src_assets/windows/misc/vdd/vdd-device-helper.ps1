@@ -24,9 +24,14 @@ $deviceClassPath = 'SYSTEM\CurrentControlSet\Control\Class'
 $dnStarted = 0x00000008
 $crInvalidDevnode = 0x00000005
 $crNoSuchDevnode = 0x0000000D
+$crBufferSmall = 0x0000001A
 $deviceTimeoutSeconds = 120
 $targetedRemovalTimeoutSeconds = 10
 $win32ErrorTimeout = 1460
+$script:vddRestartRequired = $false
+$vddDeviceReady = 'Ready'
+$vddDeviceRestartRequired = 'RestartRequired'
+$vddControlInterfaceGuid = 'DA9F8C2B-7E4F-49A1-9D4E-6F2B0E1A0C4D'
 $requiredDriverFiles = @('ZakoVDD.inf', 'ZakoVDD.dll', 'zakovdd.cat', 'ZakoVDD.cer')
 
 function Initialize-CfgMgr32 {
@@ -51,6 +56,21 @@ public static class SunshineVddCfgMgr32
         out uint status,
         out uint problemNumber,
         uint deviceInstance,
+        uint flags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    public static extern uint CM_Get_Device_Interface_List_SizeW(
+        out uint bufferLength,
+        ref Guid interfaceClassGuid,
+        string deviceInstanceId,
+        uint flags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    public static extern uint CM_Get_Device_Interface_ListW(
+        ref Guid interfaceClassGuid,
+        string deviceInstanceId,
+        [Out] char[] buffer,
+        uint bufferLength,
         uint flags);
 }
 '@
@@ -85,6 +105,42 @@ function Get-VddDeviceStatus([string] $InstanceId) {
         return [pscustomobject]@{ State = 'OK'; Problem = [int]$problem }
     }
     return [pscustomobject]@{ State = 'ERROR'; Problem = [int]$problem }
+}
+
+function Test-VddControlInterfaceAvailable(
+    [int] $Attempts = 3,
+    [int] $DelayMilliseconds = 200) {
+    Initialize-CfgMgr32
+
+    $interfaceGuid = [Guid] $vddControlInterfaceGuid
+    for ($attempt = 0; $attempt -lt [Math]::Max(1, $Attempts); $attempt++) {
+        [uint32] $bufferLength = 0
+        $sizeResult = [SunshineVddCfgMgr32]::CM_Get_Device_Interface_List_SizeW(
+            [ref] $bufferLength,
+            [ref] $interfaceGuid,
+            $null,
+            0)
+        if ($sizeResult -eq 0 -and $bufferLength -gt 1) {
+            $buffer = New-Object char[] $bufferLength
+            $listResult = [SunshineVddCfgMgr32]::CM_Get_Device_Interface_ListW(
+                [ref] $interfaceGuid,
+                $null,
+                $buffer,
+                $bufferLength,
+                0)
+            if ($listResult -eq 0 -and $buffer[0] -ne [char]0) {
+                return $true
+            }
+            if ($listResult -eq $crBufferSmall) {
+                continue
+            }
+        }
+
+        if ($attempt + 1 -lt $Attempts -and $DelayMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+    return $false
 }
 
 function Get-VddDevices {
@@ -188,17 +244,49 @@ function Test-VddDeviceReady([object] $Device, [string] $ExpectedVersion = '') {
         (-not $ExpectedVersion -or $Device.Version -eq $ExpectedVersion))
 }
 
-function Get-VddDecision([object[]] $Devices, [string] $BundledVersion) {
+function Test-VddDeviceBound([object] $Device, [string] $ExpectedVersion) {
+    return [bool]($Device -and
+        $Device.InfName -match '(?i)^oem\d+\.inf$' -and
+        $Device.Version -eq $ExpectedVersion)
+}
+
+function Test-VddVersionAtLeast([string] $InstalledVersion, [string] $BundledVersion) {
+    try {
+        $installed = [version] $InstalledVersion
+        $bundled = [version] $BundledVersion
+
+        # Win10 packages moved away from the legacy 99.x/100.x DriverVer
+        # range because those versions prevent monitor enumeration on 22H2.
+        # Treat an installed legacy package as an explicit migration target;
+        # a plain numeric comparison would otherwise preserve it forever.
+        if ($bundled.Major -eq 15 -and $installed.Major -ge 99) {
+            return $false
+        }
+
+        return $installed -ge $bundled
+    }
+    catch {
+        # Never silently replace a healthy custom driver whose version cannot
+        # be compared with the bundled Windows dotted-quad version.
+        return $true
+    }
+}
+
+function Get-VddDecision(
+    [object[]] $Devices,
+    [string] $BundledVersion,
+    [bool] $ControlAvailable = $true) {
     $deviceList = @($Devices)
     $device = if ($deviceList.Count -eq 1) { $deviceList[0] } else { $null }
     $isHealthy = Test-VddDeviceReady $device
-    $isReady = Test-VddDeviceReady $device $BundledVersion
+    $isReady = (Test-VddDeviceReady $device $BundledVersion) -and $ControlAvailable
 
     return [pscustomobject]@{
         DeviceCount = $deviceList.Count
         CleanupRequired = [int]($deviceList.Count -gt 0 -and -not $isReady)
         InstallRequired = [int](-not $isReady)
         HealthyExisting = [int]$isHealthy
+        ControlAvailable = [int]$ControlAvailable
         CurrentVersion = $(if ($device) { $device.Version } else { '' })
         CurrentStatus = $(if ($device) { $device.Status } else { '' })
         CurrentInf = $(if ($device) { $device.InfName } else { '' })
@@ -303,10 +391,12 @@ function Resolve-VddPayload([string] $Directory, [string] $BuildOverride) {
 function Get-VddState([string] $InfPath) {
     $devices = @(Get-VddDevices)
     $bundledVersion = Get-BundledVersion $InfPath
+    $controlAvailable = Test-VddControlInterfaceAvailable
     return [pscustomobject]@{
         Devices = $devices
         BundledVersion = $bundledVersion
-        Decision = Get-VddDecision $devices $bundledVersion
+        ControlAvailable = $controlAvailable
+        Decision = Get-VddDecision $devices $bundledVersion $controlAvailable
     }
 }
 
@@ -321,12 +411,25 @@ function Wait-Until([scriptblock] $Condition, [int] $WaitSeconds) {
     return $false
 }
 
+function Invoke-Nefcon([string] $Path, [string[]] $Arguments) {
+    # nefconw.exe uses the Windows GUI subsystem. PowerShell can launch GUI
+    # executables asynchronously and leave LASTEXITCODE unset unless their
+    # output is consumed. Out-Host keeps the existing console output while
+    # forcing PowerShell to wait for the process to finish.
+    $global:LASTEXITCODE = $null
+    & $Path @Arguments | Out-Host
+    $exitCode = $global:LASTEXITCODE
+    if ($null -eq $exitCode) {
+        throw 'nefcon did not report an exit code.'
+    }
+    return [int] $exitCode
+}
+
 function Invoke-NefconRemoval([string] $Path, [string] $TargetHardwareId = $hardwareId) {
-    & $Path `
-        --remove-device-node `
-        --hardware-id $TargetHardwareId `
-        --class-guid $displayClassGuid
-    return $LASTEXITCODE
+    return Invoke-Nefcon $Path @(
+        '--remove-device-node',
+        '--hardware-id', $TargetHardwareId,
+        '--class-guid', $displayClassGuid)
 }
 
 function Invoke-PnpUtilDeviceRemoval([string] $InstanceId) {
@@ -373,7 +476,7 @@ function Remove-AllVddDevices([string] $NefconPath, [int] $WaitSeconds = $device
     }
 
     # Nefcon removes every matching node in one call, but Windows can finish
-    # the PnP removal asynchronously after nefcon returns. Only disconnected
+    # the PnP removal asynchronously after nefcon returns. Remaining non-ready
     # nodes need a targeted fallback; issuing a second request for live nodes can
     # race the asynchronous nefcon removal.
     $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
@@ -386,7 +489,7 @@ function Remove-AllVddDevices([string] $NefconPath, [int] $WaitSeconds = $device
         }
 
         foreach ($device in $devices) {
-            if ($device.Status -ne 'MISSING' -or
+            if ($device.Status -notin @('MISSING', 'ERROR') -or
                 $targetedAttempts.ContainsKey($device.InstanceId)) {
                 continue
             }
@@ -403,7 +506,7 @@ function Remove-AllVddDevices([string] $NefconPath, [int] $WaitSeconds = $device
 
         $stalledTargetedDevices = @($devices | Where-Object {
             $attempt = $targetedAttempts[$_.InstanceId]
-            $_.Status -eq 'MISSING' -and
+            $_.Status -in @('MISSING', 'ERROR') -and
                 $null -ne $attempt -and
                 [DateTime]::UtcNow -ge $attempt.Deadline
         })
@@ -592,36 +695,57 @@ function Add-VddDriverPackage([object] $Payload) {
 function Install-VddDeviceFromInf(
     [string] $NefconPath,
     [string] $InfPath,
-    [string] $ExpectedVersion) {
+    [string] $ExpectedVersion,
+    [bool] $RequireControlInterface = $true) {
     foreach ($requiredPath in @($NefconPath, $InfPath)) {
         if (-not (Test-Path -LiteralPath $requiredPath)) {
             throw "Required VDD installer file is unavailable: $requiredPath"
         }
     }
 
-    Write-Output 'Creating VDD adapter...'
-    & $NefconPath `
-        --create-device-node `
-        --hardware-id $hardwareId `
-        --service-name $serviceName `
-        --class-name Display `
-        --class-guid $displayClassGuid
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create the VDD device node (exit code $LASTEXITCODE)."
+    Write-Host 'Creating VDD adapter...'
+    $nefconExitCode = Invoke-Nefcon $NefconPath @(
+        '--create-device-node',
+        '--hardware-id', $hardwareId,
+        '--service-name', $serviceName,
+        '--class-name', 'Display',
+        '--class-guid', $displayClassGuid)
+    if ($nefconExitCode -ne 0) {
+        throw "Failed to create the VDD device node (exit code $nefconExitCode)."
     }
 
-    & $NefconPath --install-driver --inf-path $InfPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to bind the VDD driver (exit code $LASTEXITCODE)."
+    $nefconExitCode = Invoke-Nefcon $NefconPath @('--install-driver', '--inf-path', $InfPath)
+    if ($nefconExitCode -notin @(0, 3010)) {
+        throw "Failed to bind the VDD driver (exit code $nefconExitCode)."
+    }
+    $restartSuggested = $nefconExitCode -eq 3010
+    if ($restartSuggested) {
+        Write-Host 'Windows suggested a restart after binding the VDD driver; checking whether the device is already ready...'
     }
 
-    if (-not (Wait-Until {
+    $isReady = Wait-Until {
         $devices = @(Get-VddDevices)
         $devices.Count -eq 1 -and
-            (Test-VddDeviceReady $devices[0] $ExpectedVersion)
-    } $deviceTimeoutSeconds)) {
-        throw "VDD did not become ready at version $ExpectedVersion."
+            (Test-VddDeviceReady $devices[0] $ExpectedVersion) -and
+            (-not $RequireControlInterface -or
+                (Test-VddControlInterfaceAvailable 1 0))
+    } $deviceTimeoutSeconds
+
+    if (-not $isReady) {
+        $devices = @(Get-VddDevices)
+        if ($devices.Count -eq 1 -and
+            (Test-VddDeviceBound $devices[0] $ExpectedVersion)) {
+            Write-Warning 'The expected VDD package is bound, but the device or control interface is not ready. A Windows restart is required.'
+            return $vddDeviceRestartRequired
+        }
+
+        $readiness = if ($RequireControlInterface) { ' with its control interface' } else { '' }
+        throw "VDD did not bind and become ready$readiness at version $ExpectedVersion."
     }
+    if ($restartSuggested) {
+        Write-Host 'VDD is ready; continuing without a restart.'
+    }
+    return $vddDeviceReady
 }
 
 function Install-VddDevice([object] $Payload, [string] $ExpectedVersion) {
@@ -641,23 +765,29 @@ function Restore-VddDevice([object] $Payload, [object] $PreviousDevice) {
     $previousDeviceStillReady = $devices.Count -eq 1 -and
         (Test-VddDeviceReady $devices[0] $PreviousDevice.Version) -and
         $devices[0].InfName -ieq $PreviousDevice.InfName
+    $restoreResult = $vddDeviceReady
     if (-not $previousDeviceStillReady) {
         if ($devices.Count -gt 0) {
             Remove-AllVddDevices $Payload.Paths.Nefcon
         }
-        Write-Output "Restoring previous VDD version $($PreviousDevice.Version)..."
-        Install-VddDeviceFromInf `
+        Write-Host "Restoring previous VDD version $($PreviousDevice.Version)..."
+        $restoreResult = Install-VddDeviceFromInf `
             $Payload.Paths.Nefcon `
             $previousInf `
-            $PreviousDevice.Version
+            $PreviousDevice.Version `
+            $false
+        if ($restoreResult -eq $vddDeviceRestartRequired) {
+            return $restoreResult
+        }
     }
 
     try {
-        Cleanup-VddPackages $PreviousDevice.Version
+        Cleanup-VddPackages $PreviousDevice.Version | Out-Host
     }
     catch {
         Write-Warning "Previous VDD was restored, but staged package cleanup failed: $($_.Exception.Message)"
     }
+    return $restoreResult
 }
 
 function Get-VddTransactionPath([object] $Payload) {
@@ -688,7 +818,7 @@ function Clear-VddTransaction([object] $Payload) {
 function Recover-VddTransaction([object] $Payload, [string] $BundledVersion) {
     $transactionPath = Get-VddTransactionPath $Payload
     if (-not (Test-Path -LiteralPath $transactionPath)) {
-        return
+        return $vddDeviceReady
     }
 
     try {
@@ -711,17 +841,21 @@ function Recover-VddTransaction([object] $Payload, [string] $BundledVersion) {
     if ($readyDevice) {
         if ($readyDevice.Version -in @($BundledVersion, $transaction.PreviousVersion)) {
             Clear-VddTransaction $Payload
-            return
+            return $vddDeviceReady
         }
         throw 'A pending VDD update exists, but a different healthy driver is active; refusing automatic recovery.'
     }
 
-    Write-Output 'Recovering an interrupted VDD driver update...'
-    Restore-VddDevice $Payload ([pscustomobject]@{
+    Write-Host 'Recovering an interrupted VDD driver update...'
+    $restoreResult = Restore-VddDevice $Payload ([pscustomobject]@{
         Version = [string] $transaction.PreviousVersion
         InfName = [string] $transaction.PreviousInf
     })
+    if ($restoreResult -eq $vddDeviceRestartRequired) {
+        return $restoreResult
+    }
     Clear-VddTransaction $Payload
+    return $vddDeviceReady
 }
 
 function Invoke-VddInstall(
@@ -748,7 +882,12 @@ function Invoke-VddInstall(
     $state = Get-VddState (Join-Path $payload.DriverDir 'ZakoVDD.inf')
     if ($InstallMode -eq 'Run' -and
         (Test-Path -LiteralPath (Get-VddTransactionPath $payload))) {
-        Recover-VddTransaction $payload $state.BundledVersion
+        $recoveryResult = Recover-VddTransaction $payload $state.BundledVersion
+        if ($recoveryResult -eq $vddDeviceRestartRequired) {
+            $script:vddRestartRequired = $true
+            Write-Output 'VDD rollback is pending a Windows restart; preserving the update transaction.'
+            return
+        }
         $state = Get-VddState (Join-Path $payload.DriverDir 'ZakoVDD.inf')
     }
     $decision = $state.Decision
@@ -756,6 +895,7 @@ function Invoke-VddInstall(
     if ($decision.CurrentVersion) { Write-Output "Installed VDD version: $($decision.CurrentVersion)" }
     if ($decision.CurrentStatus) { Write-Output "Installed VDD status: $($decision.CurrentStatus)" }
     if ($decision.CurrentInf) { Write-Output "Active VDD package: $($decision.CurrentInf)" }
+    Write-Output "VDD control interface available: $([bool]$decision.ControlAvailable)"
     Write-Output "Bundled VDD version: $($state.BundledVersion)"
     if ($decision.InstallRequired) {
         Write-Output 'VDD state requires reconciliation before installation.'
@@ -765,10 +905,11 @@ function Invoke-VddInstall(
     }
     if ($InstallMode -eq 'ProbeOnly') {
         $devices = @($state.Devices)
-        $decision = Get-VddDecision $devices $state.BundledVersion
+        $decision = Get-VddDecision $devices $state.BundledVersion $state.ControlAvailable
         $device = if ($decision.DeviceCount -eq 1) { $devices[0] } else { $null }
         Write-Output 'VDD_PROBE_OK=1'
         Write-Output ('VDD_DEVICE_PRESENT=' + [int]($decision.DeviceCount -gt 0))
+        Write-Output ('VDD_CONTROL_AVAILABLE=' + $decision.ControlAvailable)
         Write-Output ('CURRENT_VDD_VERSION=' + $decision.CurrentVersion)
         Write-Output ('CURRENT_VDD_STATUS=' + $decision.CurrentStatus)
         Write-Output ('CURRENT_VDD_PROBLEM=' + $(if ($device) { [int]$device.Problem } else { '' }))
@@ -781,8 +922,10 @@ function Invoke-VddInstall(
 
     if ($PreserveHealthyExisting -and
         $decision.InstallRequired -and
-        $decision.HealthyExisting) {
-        Write-Output 'A healthy VDD is already active; deferring the bundled driver update.'
+        $decision.HealthyExisting -and
+        $decision.ControlAvailable -and
+        (Test-VddVersionAtLeast $decision.CurrentVersion $state.BundledVersion)) {
+        Write-Output 'A healthy same-or-newer VDD is already active; deferring the bundled driver update.'
         Write-Output 'VDD_DRIVER_UPDATE_DEFERRED=1'
         return
     }
@@ -800,7 +943,12 @@ function Invoke-VddInstall(
             if ($decision.CleanupRequired) {
                 Remove-AllVddDevices $payload.Paths.Nefcon
             }
-            Install-VddDevice $payload $state.BundledVersion
+            $installResult = Install-VddDevice $payload $state.BundledVersion
+            if ($installResult -eq $vddDeviceRestartRequired) {
+                $script:vddRestartRequired = $true
+                Write-Output 'VDD installation is pending a Windows restart; preserving the previous package and update transaction.'
+                return
+            }
             if ($previousDevice) {
                 Clear-VddTransaction $payload
             }
@@ -809,7 +957,12 @@ function Invoke-VddInstall(
             $installFailure = $_
             if ($previousDevice) {
                 try {
-                    Restore-VddDevice $payload $previousDevice
+                    $restoreResult = Restore-VddDevice $payload $previousDevice
+                    if ($restoreResult -eq $vddDeviceRestartRequired) {
+                        $script:vddRestartRequired = $true
+                        Write-Warning 'The VDD update failed; restoring the previous driver requires a Windows restart. Preserving the update transaction.'
+                        return
+                    }
                     Clear-VddTransaction $payload
                     Write-Warning 'The VDD update failed; the previous working driver was restored.'
                 }
@@ -886,6 +1039,10 @@ function Invoke-VddDeviceHelper {
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         Invoke-VddDeviceHelper
+        if ($script:vddRestartRequired) {
+            Write-Output 'VDD_RESTART_REQUIRED=1'
+            exit 3010
+        }
         exit 0
     }
     catch {

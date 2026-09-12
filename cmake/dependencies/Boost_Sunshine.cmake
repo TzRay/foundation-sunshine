@@ -7,11 +7,13 @@ set(BOOST_VERSION "1.92.0")
 set(BOOST_RELEASE_VERSION "1.92.0")
 set(BOOST_COMPONENTS
         atomic
+        asio
         beast
         filesystem
         function
         locale
         log
+        process
         program_options
         system
         thread
@@ -49,13 +51,18 @@ if(NOT Boost_FOUND)
 
     # more components required for compiling boost targets
     list(APPEND BOOST_COMPONENTS
-            asio
             crc
             format
-            process
             property_tree)
 
     set(BOOST_ENABLE_CMAKE ON)
+
+    if(WIN32)
+        # The Windows backend already provides the locale services Sunshine uses.
+        # Enabling a host MSYS2 ICU installation makes the portable executable
+        # depend on versioned development-environment DLLs that are not shipped.
+        set(BOOST_LOCALE_ENABLE_ICU OFF CACHE BOOL "Build Boost.Locale without ICU on Windows" FORCE)
+    endif()
 
     # Limit boost to the required libraries only
     set(BOOST_INCLUDE_LIBRARIES ${BOOST_COMPONENTS})

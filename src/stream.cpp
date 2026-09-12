@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
-#include <iomanip>
 #include <optional>
 #include <queue>
 #include <unordered_map>
@@ -65,6 +64,8 @@ extern "C" {
 #include "clipboard_bridge.h"
 #include "cursor_channel.h"
 #include "platform/common.h"
+#include "touch_keyboard_session.h"
+#include "text_context/bridge.h"
 
 #define IDX_START_A 0
 #define IDX_START_B 1
@@ -89,6 +90,7 @@ extern "C" {
 #define IDX_CURSOR 21  // Local cursor mode/update (Sunshine protocol extension)
 #define IDX_DS5_HAPTICS_PCM 22  // Authored DualSense actuator PCM (Sunshine protocol extension)
 #define IDX_DS5_HAPTICS_IR_V2 23  // Device-independent analyzed haptics (Sunshine protocol extension)
+#define IDX_TEXT_CONTEXT 24  // Remote text focus/context update (Sunshine protocol extension)
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -115,6 +117,7 @@ static const short packetTypes[] = {
   0x5509,  // Local cursor mode/update (Sunshine protocol extension)
   0x550A,  // Authored DualSense haptics PCM (Sunshine protocol extension)
   0x550B,  // Device-independent DualSense haptics IR v2 (Sunshine protocol extension)
+  0x550C,  // Remote text context update (Sunshine protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -568,6 +571,7 @@ namespace stream {
     std::unordered_map<std::uint32_t, boost::shared_ptr<mic_session_ctx_t>> mic_sessions;
     boost::mutex mic_session_mutex;
     boost::atomic<std::uint32_t> mic_session_count { 0 };
+    boost::atomic<bool> mic_playout_reset_pending { false };
   };
 
   struct session_t {
@@ -678,6 +682,9 @@ namespace stream {
     // 保存 launch_session 的关键字段，用于动态参数更新
     bool enable_sops { false };
     bool enable_hdr { false };
+    rtsp_stream::synthetic_hdr_config_t synthetic_hdr;
+    platf::frame_pipeline_policy_t frame_pipeline_policy;
+    bool frame_pipeline_policy_resolved { false };
     hdr::client_display_capabilities_t hdr_capabilities;
     hdr::client_display_capabilities_t reported_hdr_capabilities;
     // Runtime SDR white updates are consumed by the video thread and may also
@@ -948,6 +955,11 @@ namespace stream {
 
     const auto remaining_sessions = static_cast<std::uint32_t>(ctx.mic_sessions.size());
     ctx.mic_session_count.store(remaining_sessions, boost::memory_order_release);
+    if (remaining_sessions == 0) {
+      // 记录会话计数经过零点的边沿。即使新会话在 cancel 回调执行前接入，
+      // 麦克风线程也必须从新的绝对播放截止时间开始。
+      ctx.mic_playout_reset_pending.store(true, boost::memory_order_release);
+    }
     if (remaining_sessions != 0) {
       return true;
     }
@@ -1746,6 +1758,32 @@ namespace stream {
   }
 
   int
+  send_text_context(session_t *session, const text_context::payload_t &payload) {
+    if (!session->control.peer || session->config.controlProtocolType != 13 ||
+        payload.size() != text_context::kWireSize) {
+      return -1;
+    }
+    const std::size_t plaintext_size = sizeof(control_header_v2) + payload.size();
+    std::vector<std::uint8_t> plaintext(plaintext_size);
+    auto *hdr = reinterpret_cast<control_header_v2 *>(plaintext.data());
+    hdr->type = packetTypes[IDX_TEXT_CONTEXT];
+    hdr->payloadLength = static_cast<std::uint16_t>(payload.size());
+    std::memcpy(plaintext.data() + sizeof(control_header_v2), payload.data(), payload.size());
+
+    std::vector<std::uint8_t> encrypted(
+      sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(plaintext.size()) +
+      crypto::cipher::tag_size);
+    const auto view = encode_control_buf(session,
+      std::string_view {reinterpret_cast<char *>(plaintext.data()), plaintext.size()},
+      encrypted.data(), encrypted.size());
+    if (view.empty() || session->broadcast_ref->control_server.send(view, session->control.peer)) {
+      BOOST_LOG(warning) << "Couldn't send remote text context packet"sv;
+      return -1;
+    }
+    return 0;
+  }
+
+  int
   send_cursor_update(session_t *session,
                      const cursor_channel::snapshot_t &cursor,
                      bool include_shape) {
@@ -1925,6 +1963,12 @@ namespace stream {
       temp_launch_session.height = new_height;
       temp_launch_session.fps = session->config.monitor.framerate;
       temp_launch_session.enable_hdr = session->enable_hdr;
+      // Keep the synthetic-HDR state and the resolved frame pipeline policy in
+      // sync with the active session; dropping them would re-parse the display
+      // prep decision and flip the source display to HDR mid-stream.
+      temp_launch_session.synthetic_hdr = session->synthetic_hdr;
+      temp_launch_session.frame_pipeline_policy = session->frame_pipeline_policy;
+      temp_launch_session.frame_pipeline_policy_resolved = session->frame_pipeline_policy_resolved;
       temp_launch_session.enable_sops = session->enable_sops;
       temp_launch_session.use_vdd = session->use_vdd;
       temp_launch_session.custom_screen_mode = session->custom_screen_mode;
@@ -2076,7 +2120,7 @@ namespace stream {
         return;
       }
 
-      // This is an HLG conversion parameter, not part of the display/VDD HDR
+      // This is an HDR conversion parameter, not part of the display/VDD HDR
       // capability tuple. Apply it on the video thread without rebuilding the
       // display or encoder.
       if (param_type_enum == video::dynamic_param_type_e::CLIENT_SDR_WHITE_NITS) {
@@ -2086,8 +2130,8 @@ namespace stream {
                              << SDR_WHITE_PAYLOAD_SIZE << " bytes, got " << payload.size();
           return;
         }
-        if (session->config.controlProtocolType != 13 || session->config.monitor.dynamicRange != 2) {
-          BOOST_LOG(warning) << "Ignoring client SDR white update outside an encrypted HLG session";
+        if (session->config.controlProtocolType != 13 || session->config.monitor.dynamicRange == 0) {
+          BOOST_LOG(warning) << "Ignoring client SDR white update outside an encrypted HDR session";
           return;
         }
 
@@ -2369,6 +2413,7 @@ namespace stream {
 
           if (session->lifecycle.state() == session::state_e::STOPPING) {
             clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
+            text_context::bridge_t::instance().session_stopped(session->launch_session_id);
             cursor_channel::remove_session(session->launch_session_id);
             pos = server->_sessions->erase(pos);
 
@@ -2503,6 +2548,24 @@ namespace stream {
             }
           }
         }
+
+        {
+          std::deque<text_context::outbound_msg_t> messages;
+          text_context::bridge_t::instance().drain_outbound(messages);
+          for (auto &message : messages) {
+            bool delivered = false;
+            for (auto *session : *server->_sessions) {
+              if (!session->control.peer || session->launch_session_id != message.target ||
+                  (session->config.mlFeatureFlags & ML_FF_REMOTE_TEXT_CONTEXT) == 0) {
+                continue;
+              }
+              delivered = send_text_context(session, message.bytes) == 0;
+              break;
+            }
+            BOOST_LOG(debug) << "Remote text context outbound: target=" << message.target
+                            << ", delivered=" << delivered;
+          }
+        }
       }
 
       // Don't break until any pending sessions either expire or connect
@@ -2514,6 +2577,10 @@ namespace stream {
       // Cursor shapes are low-frequency, but pointer role transitions should
       // still feel immediate. Poll the latest-value bridge once per frame while
       // local cursor mode is active without adding another control thread.
+      // Text-context sends ride the same wakeups instead of raising the cadence
+      // permanently: every observation is preceded by that client's touch/mouse
+      // packets, and enet_host_service returns per incoming event, so the drain
+      // runs on traffic; the idle timeout bounds delivery on a quiet socket.
       server->iterate(has_ds5_haptics_session ? 5ms :
                       cursor_channel::local_mode_active() ? 16ms : 150ms);
     }
@@ -2540,6 +2607,7 @@ namespace stream {
       // final shutdown path instead, make the same paired lifecycle update here
       // so capability/session_count cannot retain stale launch IDs.
       clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
+      text_context::bridge_t::instance().session_stopped(session->launch_session_id);
       cursor_channel::remove_session(session->launch_session_id);
 
       // We may not have gotten far enough to have an ENet connection yet
@@ -2596,13 +2664,48 @@ namespace stream {
       uint64_t invalid_data = 0;
       uint64_t unregistered = 0;
       uint64_t route_ambiguous = 0;
+      uint64_t wasapi_backpressure_drops = 0;
     };
     MicStats stats;
+
+    auto log_mic_stats = [&](std::string_view reason) {
+      const auto mixer_stats = mixer.take_stats();
+      const auto has_diagnostics = stats.total_packets != 0 ||
+                                   stats.wasapi_backpressure_drops != 0 ||
+                                   mixer_stats.duplicate_packets != 0 ||
+                                   mixer_stats.late_packets != 0 ||
+                                   mixer_stats.buffer_overflow_packets != 0 ||
+                                   mixer_stats.timeline_reanchors != 0 ||
+                                   mixer_stats.plc_frames != 0 ||
+                                   mixer_stats.decode_failures != 0 ||
+                                   mixer_stats.skipped_playout_frames != 0;
+      if (!has_diagnostics) {
+        stats = {};
+        return;
+      }
+
+      BOOST_LOG(info) << "Microphone diagnostics ("sv << reason
+                      << "): packets="sv << stats.total_packets
+                      << ", accepted="sv << stats.accepted_packets
+                      << ", route_decode_failed="sv << stats.decode_failed
+                      << ", invalid="sv << stats.invalid_data
+                      << ", unregistered="sv << stats.unregistered
+                      << ", route_ambiguous="sv << stats.route_ambiguous
+                      << ", duplicate="sv << mixer_stats.duplicate_packets
+                      << ", late="sv << mixer_stats.late_packets
+                      << ", queue_overflow="sv << mixer_stats.buffer_overflow_packets
+                      << ", reanchors="sv << mixer_stats.timeline_reanchors
+                      << ", plc="sv << mixer_stats.plc_frames
+                      << ", opus_decode_failed="sv << mixer_stats.decode_failures
+                      << ", skipped_slots="sv << mixer_stats.skipped_playout_frames
+                      << ", wasapi_drops="sv << stats.wasapi_backpressure_drops;
+      stats = {};
+    };
 
     auto release_mic_device = [&]() {
       if (mic_device_initialized) {
         audio::release_mic_redirect_device();
-        BOOST_LOG(debug) << "Microphone device released"sv;
+        BOOST_LOG(debug) << "Microphone redirect session released"sv;
       }
       mic_device_initialized = false;
       mic_audio_ref = {};
@@ -2643,6 +2746,7 @@ namespace stream {
     auto process_audio_data = [&](const std::uint8_t *audio_data,
                                   std::size_t data_size,
                                   std::uint16_t sequence_number,
+                                  std::optional<std::uint32_t> timestamp_ms,
                                   std::uint32_t source_key_id,
                                   const udp::endpoint &source_endpoint) {
       if (!ctx.mic_socket_enabled.load()) {
@@ -2742,7 +2846,8 @@ namespace stream {
             mic_session->session_id,
             decoded_payload.data(),
             decoded_payload.size(),
-            sequence_number)) {
+            sequence_number,
+            timestamp_ms)) {
         ++stats.invalid_data;
         return;
       }
@@ -2776,21 +2881,32 @@ namespace stream {
       ++stats.accepted_packets;
     };
 
+    auto retry_delay = 300ms;  // 初始重试延迟，连续错误指数退避到最大5秒
     boost::function<void(const boost::system::error_code, size_t)> mic_recv_func;
     boost::function<void()> schedule_mix;
     bool retry_receive_after_error = false;
     bool reset_mic_io_cycle = false;
+    bool reopen_mic_socket_after_error = false;
     bool mix_timer_armed = false;
     std::uint64_t mix_timer_generation = 0;
+    using mix_clock_t = asio::steady_timer::clock_type;
+    std::optional<mix_clock_t::time_point> next_mix_deadline;
     asio::steady_timer mix_timer {mic_io};
     auto cancel_mix_timer = [&]() {
       mix_timer_armed = false;
       ++mix_timer_generation;
+      next_mix_deadline.reset();
       try {
         mix_timer.cancel();
       }
       catch (const std::exception &e) {
         BOOST_LOG(error) << "Failed to cancel microphone mix timer: "sv << e.what();
+      }
+    };
+    auto reset_playout_clock_if_pending = [&]() {
+      if (ctx.mic_playout_reset_pending.load(boost::memory_order_acquire) &&
+          ctx.mic_playout_reset_pending.exchange(false, boost::memory_order_acq_rel)) {
+        cancel_mix_timer();
       }
     };
     auto schedule_receive = [&]() -> bool {
@@ -2812,6 +2928,13 @@ namespace stream {
         return false;
       }
     };
+    auto retry_with_reopened_mic_socket = [&]() {
+      retry_receive_after_error = true;
+      mixer.clear();
+      mixer_sources.clear();
+      reopen_mic_socket_after_error = true;
+      cancel_mix_timer();
+    };
 
     mic_recv_func = [&](const boost::system::error_code &ec, size_t received_bytes) {
       if (!ctx.mic_socket_enabled.load()) {
@@ -2830,8 +2953,16 @@ namespace stream {
             schedule_mix();
           }
           else {
-            retry_receive_after_error = true;
-            cancel_mix_timer();
+            if (!broadcast_shutdown_event->peek() &&
+                ctx.mic_socket_enabled.load() &&
+                ctx.mic_session_count.load(boost::memory_order_acquire) != 0 &&
+                mic_device_initialized) {
+              retry_with_reopened_mic_socket();
+            }
+            else {
+              reset_mic_io_cycle = true;
+              cancel_mix_timer();
+            }
           }
         }
         else {
@@ -2858,14 +2989,16 @@ namespace stream {
         }
         else {
           BOOST_LOG(error) << "Mic socket error: "sv << ec.message();
-          retry_receive_after_error = true;
           fg.disable();
-          cancel_mix_timer();
+          // 未分类 socket 错误会进入退避重试。旧播放 slot 已失去实时性，
+          // 只清理 mixer 状态，不重建与网络错误无关的 WASAPI 设备。
+          retry_with_reopened_mic_socket();
         }
         return;
       }
 
       retry_receive_after_error = false;
+      retry_delay = 300ms;
 
       if (received_bytes < sizeof(RTP_PACKET)) {
         return;
@@ -2883,6 +3016,7 @@ namespace stream {
               reinterpret_cast<const uint8_t *>(mic_recv_buffer.data()) + header_size,
               received_bytes - header_size,
               sequence_number,
+              std::nullopt,
               source_key_id,
               peer);
           }
@@ -2898,6 +3032,7 @@ namespace stream {
           // 客户端按小端序发送序列号（MicrophoneStream.java 使用 LITTLE_ENDIAN）
           // 服务端必须按小端序读取，否则会读错（比如 1 会读成 256）
           uint16_t sequence_number = util::endian::little(header->rtp.sequenceNumber);
+          const auto timestamp_ms = util::endian::little(header->rtp.timestamp);
           const auto source_key_id = util::endian::little(header->rtp.ssrc);
           size_t data_size = received_bytes - header_size;
           
@@ -2910,6 +3045,7 @@ namespace stream {
             reinterpret_cast<const uint8_t *>(mic_recv_buffer.data()) + header_size,
             data_size,
             sequence_number,
+            timestamp_ms,
             source_key_id,
             peer);
         }
@@ -2917,14 +3053,25 @@ namespace stream {
     };
 
     schedule_mix = [&]() {
+      reset_playout_clock_if_pending();
+      if (ctx.mic_session_count.load(boost::memory_order_acquire) == 0) {
+        return;
+      }
       if (mix_timer_armed) {
         return;
       }
 
       mix_timer_armed = true;
       const auto generation = ++mix_timer_generation;
-      mix_timer.expires_after(20ms);
+      if (!next_mix_deadline) {
+        next_mix_deadline = mix_clock_t::now() + 20ms;
+      }
+      mix_timer.expires_at(*next_mix_deadline);
       mix_timer.async_wait([&, generation](const boost::system::error_code &ec) {
+        if (generation != mix_timer_generation) {
+          return;
+        }
+        reset_playout_clock_if_pending();
         if (generation != mix_timer_generation) {
           return;
         }
@@ -2936,6 +3083,13 @@ namespace stream {
             reset_mic_io_cycle ||
             ctx.mic_session_count.load(boost::memory_order_acquire) == 0) {
           return;
+        }
+
+        const auto now = mix_clock_t::now();
+        if (now >= *next_mix_deadline + 20ms) {
+          const auto missed_frames = static_cast<std::size_t>((now - *next_mix_deadline) / 20ms);
+          mixer.skip_playout_frames(missed_frames);
+          *next_mix_deadline += 20ms * missed_frames;
         }
 
         std::unordered_set<mic_mixer::source_id_t> registered_sources;
@@ -2958,31 +3112,75 @@ namespace stream {
         }
 
         if (auto mixed = mixer.mix_next_frame()) {
-          if (audio::write_mic_pcm(mixed->data(), mixed->size()) == -2) {
-            BOOST_LOG(info) << "Microphone output device was invalidated; reinitializing"sv;
+          const auto write_result = audio::write_mic_pcm(mixed->data(), mixed->size());
+          if (write_result == 0) {
+            ++stats.wasapi_backpressure_drops;
+          }
+          if (write_result < 0) {
+            if (write_result == -2) {
+              BOOST_LOG(info) << "Microphone output backend became unavailable; reinitializing"sv;
+            }
+            else {
+              BOOST_LOG(warning) << "Microphone output write failed; reinitializing"sv;
+            }
             release_mic_device();
             retry_receive_after_error = true;
+            reset_mic_io_cycle = true;
+            cancel_mix_timer();
 
             boost::lock_guard<boost::mutex> lock(ctx.mic_socket_mutex);
             cancel_mic_receive_locked(ctx);
             return;
           }
         }
+
+        *next_mix_deadline += 20ms;
         schedule_mix();
       });
     };
 
     BOOST_LOG(debug) << "Starting microphone receive thread";
 
-    auto retry_delay = 300ms;  // 初始重试延迟，指数退避到最大5秒
+    bool had_active_mic_sessions = false;
 
     while (!broadcast_shutdown_event->peek()) {
-      if (!ctx.mic_socket_enabled.load() ||
-          ctx.mic_session_count.load(boost::memory_order_acquire) == 0) {
+      if (ctx.mic_session_count.load(boost::memory_order_acquire) == 0) {
         retry_delay = 300ms;  // 会话结束时重置延迟
+        reset_playout_clock_if_pending();
         release_mic_device();
-        std::this_thread::sleep_for(100ms);
+        if (had_active_mic_sessions) {
+          log_mic_stats("sessions ended"sv);
+          had_active_mic_sessions = false;
+        }
+        (void) broadcast_shutdown_event->view(100ms);
         continue;
+      }
+      had_active_mic_sessions = true;
+
+      if (reopen_mic_socket_after_error || !ctx.mic_socket_enabled.load()) {
+        bool has_active_sessions = false;
+        bool socket_ready = false;
+        {
+          // 复用注册/注销路径的锁序，在会话锁内重新确认 shutdown 尚未清空会话。
+          boost::lock_guard<boost::mutex> session_lock(ctx.mic_session_mutex);
+          has_active_sessions = !ctx.mic_sessions.empty();
+          if (has_active_sessions) {
+            boost::lock_guard<boost::mutex> socket_lock(ctx.mic_socket_mutex);
+            if (reopen_mic_socket_after_error) {
+              close_mic_socket_locked(ctx);
+            }
+            socket_ready = open_mic_socket_locked(ctx);
+          }
+        }
+        if (!has_active_sessions) {
+          continue;
+        }
+        if (!socket_ready) {
+          (void) broadcast_shutdown_event->view(retry_delay);
+          retry_delay = std::min(retry_delay * 2, 5000ms);
+          continue;
+        }
+        reopen_mic_socket_after_error = false;
       }
 
       // 在麦克风设备的完整生命周期内持有音频上下文，确保音频采集退出后仍能恢复设备。
@@ -2990,7 +3188,7 @@ namespace stream {
         if (!audio_thread_guard) {
           audio_thread_guard = platf::init_audio_thread();
           if (!audio_thread_guard) {
-            std::this_thread::sleep_for(retry_delay);
+            (void) broadcast_shutdown_event->view(retry_delay);
             retry_delay = std::min(retry_delay * 2, 5000ms);
             continue;
           }
@@ -3000,14 +3198,14 @@ namespace stream {
         // 会话需要能够创建并持有自己的音频控制上下文。
         mic_audio_ref = audio::get_audio_ctx_ref();
         if (!mic_audio_ref) {
-          std::this_thread::sleep_for(retry_delay);
+          (void) broadcast_shutdown_event->view(retry_delay);
           retry_delay = std::min(retry_delay * 2, 5000ms);
           continue;
         }
 
         if (audio::init_mic_redirect_device() != 0) {
           mic_audio_ref = {};
-          std::this_thread::sleep_for(retry_delay);
+          (void) broadcast_shutdown_event->view(retry_delay);
           retry_delay = std::min(retry_delay * 2, 5000ms);  // 指数退避，最大5秒
           continue;
         }
@@ -3030,7 +3228,7 @@ namespace stream {
       reset_mic_io_cycle = false;
       if (!schedule_receive()) {
         if (ctx.mic_socket_enabled.load() && !broadcast_shutdown_event->peek()) {
-          std::this_thread::sleep_for(100ms);
+          (void) broadcast_shutdown_event->view(100ms);
         }
         continue;
       }
@@ -3040,23 +3238,13 @@ namespace stream {
       if (retry_receive_after_error &&
           ctx.mic_socket_enabled.load() &&
           !broadcast_shutdown_event->peek()) {
-        std::this_thread::sleep_for(retry_delay);
+        (void) broadcast_shutdown_event->view(retry_delay);
         retry_delay = std::min(retry_delay * 2, 5000ms);
       }
     }
 
     release_mic_device();
-
-    if (stats.total_packets > 0) {
-      BOOST_LOG(info) << "=== Microphone Packet Stats Summary ===";
-      const auto success_rate = (double) stats.accepted_packets / stats.total_packets * 100.0;
-      BOOST_LOG(info) << "total=" << stats.total_packets
-                      << ", accepted=" << stats.accepted_packets << " (" << std::fixed << std::setprecision(1) << success_rate << "%)"
-                      << ", decode_failed=" << stats.decode_failed
-                      << ", invalid=" << stats.invalid_data
-                      << ", unregistered=" << stats.unregistered
-                      << ", route_ambiguous=" << stats.route_ambiguous;
-    }
+    log_mic_stats("shutdown"sv);
 
     BOOST_LOG(debug) << "Microphone receive thread ended";
   }
@@ -4045,6 +4233,12 @@ namespace stream {
             display_device::session_t::get().restore_state();
           }
 
+#ifdef _WIN32
+          // Restore the touch-keyboard registry transaction started at
+          // stream start (see the touch_kb mount in nvhttp_stream_start).
+          touch_kb::end_session();
+#endif
+
           platf::streaming_will_stop();
         }
       }
@@ -4091,7 +4285,7 @@ namespace stream {
 
     int
     start(session_t &session, const std::string &addr_string) {
-      session.input = input::alloc(session.mail);
+      session.input = input::alloc(session.mail, session.launch_session_id);
 
       session.broadcast_ref = broadcast_shared.ref();
       if (!session.broadcast_ref) {
@@ -4136,6 +4330,12 @@ namespace stream {
       else {
         BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
       }
+
+      // Register with the text-context bridge before publishing the session:
+      // once the pointer is in the shared list the control thread may dispatch
+      // input immediately, and an unregistered launch ID would silently drop
+      // that first click/touch candidate.
+      text_context::bridge_t::instance().session_started(session.launch_session_id);
 
       // 将完成初始化的会话加入共享列表。
       {
@@ -4253,6 +4453,9 @@ namespace stream {
       // 保存 launch_session 的关键字段，用于后续动态参数更新
       session->enable_sops = launch_session.enable_sops;
       session->enable_hdr = launch_session.enable_hdr;
+      session->synthetic_hdr = launch_session.synthetic_hdr;
+      session->frame_pipeline_policy = launch_session.frame_pipeline_policy;
+      session->frame_pipeline_policy_resolved = launch_session.frame_pipeline_policy_resolved;
       session->hdr_capabilities = launch_session.hdr_capabilities;
       session->reported_hdr_capabilities = launch_session.reported_hdr_capabilities;
       session->dynamic_sdr_white_nits.store(

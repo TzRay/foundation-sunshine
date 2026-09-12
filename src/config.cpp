@@ -483,6 +483,7 @@ namespace config {
   audio_t audio {
     {},  // audio_sink
     {},  // virtual_sink
+    "vb_cable"s,  // microphone_redirect_backend
     true,  // stream audio
     true,  // stream_mic (enable microphone streaming from client)
     true,  // install_steam_drivers
@@ -510,6 +511,8 @@ namespace config {
     "sunshine_state.json"s,  // file_state
     "[]"s,  // file_mappings
     48020,  // file_mapping_port
+    false,  // usb_forwarding_enabled: explicit host opt-in
+    0,  // usb_forwarding_port: automatic (main port + 7)
     {},  // external_ip
     {
       "1280x720"s,
@@ -566,6 +569,7 @@ namespace config {
     true,  // virtual mouse (use driver if available)
     false, // amf_draw_mouse_cursor
     true,  // clipboard_sync (default on; effective only when the user-session GUI agent is alive and forwards data)
+    true,  // client_gamepad_override (client-declared type wins; no official client sends it today)
   };
 
   sunshine_t sunshine {
@@ -1451,6 +1455,14 @@ namespace config {
     int file_mapping_port = nvhttp.file_mapping_port;
     int_between_f(vars, "file_mapping_port", file_mapping_port, { 1024, 65535 });
     nvhttp.file_mapping_port = static_cast<std::uint16_t>(file_mapping_port);
+    bool_f(vars, "usb_forwarding_enabled", nvhttp.usb_forwarding_enabled);
+    int usb_forwarding_port = nvhttp.usb_forwarding_port;
+    int_f(vars, "usb_forwarding_port", usb_forwarding_port);
+    if (usb_forwarding_port == 0 || (usb_forwarding_port >= 1024 && usb_forwarding_port <= 65535)) {
+      nvhttp.usb_forwarding_port = static_cast<std::uint16_t>(usb_forwarding_port);
+    } else {
+      BOOST_LOG(warning) << "Ignoring invalid usb_forwarding_port: expected 0 or 1024-65535";
+    }
 
     // Must be run after "file_state"
     config::sunshine.credentials_file = config::nvhttp.file_state;
@@ -1481,6 +1493,12 @@ namespace config {
 
     string_f(vars, "audio_sink", audio.sink);
     string_f(vars, "virtual_sink", audio.virtual_sink);
+    string_restricted_f(
+      vars,
+      "microphone_redirect_backend",
+      audio.microphone_redirect_backend,
+      { "vb_cable"sv, "usbip_experimental"sv, "auto"sv, "disabled"sv }
+    );
     bool_f(vars, "stream_audio", audio.stream);
     bool_f(vars, "stream_mic", audio.stream_mic);
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
@@ -1549,6 +1567,7 @@ namespace config {
     bool_f(vars, "motion_as_ds4", input.motion_as_ds4);
     bool_f(vars, "touchpad_as_ds4", input.touchpad_as_ds4);
     bool_f(vars, "enable_dsu_server", input.enable_dsu_server);
+    bool_f(vars, "client_gamepad_override", input.client_gamepad_override);
     
     int temp_port = static_cast<int>(input.dsu_server_port);
     int_between_f(vars, "dsu_server_port", temp_port, { 1024, 65535 });
@@ -1989,6 +2008,34 @@ namespace config {
   get_clients_config() {
     std::lock_guard lock { config_file_mutex };
     return nvhttp.clients;
+  }
+
+  bool
+  get_client_touch_keyboard_enabled(const std::string &uuid) {
+    if (uuid.empty()) {
+      return false;
+    }
+    try {
+      const auto clients = nlohmann::json::parse(get_clients_config());
+      if (!clients.is_array()) {
+        return false;
+      }
+      for (const auto &entry : clients) {
+        if (!entry.is_object() || !entry.contains("uuid")) {
+          continue;
+        }
+        if (entry["uuid"] != uuid) {
+          continue;
+        }
+        return entry.contains("touch") &&
+               entry["touch"].is_object() &&
+               entry["touch"].value("enabled", false) == true;
+      }
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(warning) << "Failed to read touch profile for client: " << e.what();
+    }
+    return false;
   }
 
   bool

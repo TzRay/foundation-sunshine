@@ -1,16 +1,19 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import PlatformLayout from '../../components/layout/PlatformLayout.vue'
 import VddPrerequisiteNotice from '../../components/common/VddPrerequisiteNotice.vue'
 import AdapterNameSelector from './advanced/AdapterNameSelector.vue'
 import CaptureCompatibilityOverrides from './advanced/CaptureCompatibilityOverrides.vue'
+import { createNativeRtxHdrBridge } from '../../utils/nativeRtxHdrBridge.js'
 
 const { t } = useI18n()
 
 const props = defineProps(['platform', 'config', 'global_prep_cmd'])
 
 const config = ref(props.config)
+const nativeRtxHdrManagerAvailable = ref(false)
+let nativeRtxHdrBridge
 
 // 检查是否在 Tauri 环境中（通过 inject-script.js 注入）
 const isTauri = computed(() => {
@@ -111,7 +114,22 @@ onMounted(() => {
   if (isTauri.value && isWGCSelected.value) {
     checkSunshineMode()
   }
+  nativeRtxHdrBridge = createNativeRtxHdrBridge({
+    windowObject: window,
+    documentObject: document,
+    onAvailability: (available) => { nativeRtxHdrManagerAvailable.value = available },
+  })
+  window.addEventListener('message', nativeRtxHdrBridge.handleMessage)
+  nativeRtxHdrBridge.requestContext()
 })
+
+onBeforeUnmount(() => {
+  if (nativeRtxHdrBridge) {
+    window.removeEventListener('message', nativeRtxHdrBridge.handleMessage)
+  }
+})
+
+const openNativeRtxHdrManager = () => nativeRtxHdrBridge?.openManager()
 
 watch(isWGCSelected, (newValue) => {
   if (newValue && isTauri.value) {
@@ -245,6 +263,20 @@ const hdrToggleDisabled = computed(() => codecStrategy.value !== 'modern')
           <div class="form-text">{{ $t('config.av1_mode_desc') }}</div>
         </div>
       </div>
+    </div>
+
+    <div class="settings-panel mt-3" v-if="platform === 'windows'">
+      <div class="form-label">{{ $t('config.hdr_enhanced') }}</div>
+      <button
+        type="button"
+        class="btn btn-outline-primary btn-sm mt-2"
+        :disabled="!nativeRtxHdrManagerAvailable"
+        @click="openNativeRtxHdrManager"
+      >
+        <i class="fas fa-puzzle-piece me-1" aria-hidden="true"></i>
+        {{ $t('config.hdr_enhanced_open_manager') }}
+      </button>
+      <div v-if="!nativeRtxHdrManagerAvailable" class="form-text">{{ $t('config.wgc_control_panel_only') }}</div>
     </div>
 
     <!-- Capture -->

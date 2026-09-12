@@ -10,6 +10,10 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
@@ -24,6 +28,7 @@
 #include <Simple-Web-Server/server_http.hpp>
 #include <boost/atomic.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/address.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -43,6 +48,7 @@
 #include "file_mapping/service.h"
 #include "globals.h"
 #include "hdr/session_target.h"
+#include "http_util.h"
 #include "httpcommon.h"
 #include "logging.h"
 #include "network.h"
@@ -62,6 +68,7 @@
 #include "platform/common.h"
 #include "platform/run_command.h"
 #include "process.h"
+#include "remote_usb/reverse_tunnel_service.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "tray/system_tray.h"
@@ -273,8 +280,37 @@ namespace nvhttp {
     launch_session->continuous_audio = util::from_view(get_arg(args, "continuousAudio", "0"));
     launch_session->gcmap = util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
+    if (launch_session->enable_hdr) {
+      if (const auto app_rtx_hdr = proc::proc.get_app_rtx_hdr_config(launch_session->appid); app_rtx_hdr && app_rtx_hdr->enabled) {
+        launch_session->hdr_backend = hdr_enhanced::manager().acquire_selected();
+        if (launch_session->hdr_backend && launch_session->hdr_backend->id == hdr_enhanced::NVIDIA_RTX_VIDEO_BACKEND) {
+          launch_session->synthetic_hdr = *app_rtx_hdr;
+        }
+      }
+    }
     launch_session->use_vdd = util::from_view(get_arg(args, "useVdd", "0"));
     launch_session->custom_screen_mode = util::from_view(get_arg(args, "customScreenMode", "-1"));
+    // Client-declared touch-keyboard intent (Sunshine protocol extension).
+    // -1 undeclared: fall back to the per-client server profile.
+    launch_session->touch_keyboard = util::from_view(get_arg(args, "touchKeyboard", "-1"));
+    // Client-declared controller emulation type (Sunshine protocol extension
+    // carried on the /launch and /resume query string). Values outside the
+    // host vocabulary are ignored with a warning and treated as undeclared.
+    {
+      auto declared_gamepad = get_arg(args, "gamepad", "");
+      if (!declared_gamepad.empty() &&
+          declared_gamepad != "auto"sv && declared_gamepad != "x360"sv &&
+          declared_gamepad != "ds4"sv && declared_gamepad != "ds5"sv) {
+        BOOST_LOG(warning) << "Ignoring unknown client gamepad preference: "sv << declared_gamepad;
+        declared_gamepad.clear();
+      }
+      launch_session->client_gamepad = declared_gamepad;
+      if (!declared_gamepad.empty()) {
+        BOOST_LOG(info) << "Client declared gamepad preference: "sv << declared_gamepad;
+      }
+      // Publish for the input layer (gamepads arrive after the stream starts).
+      platf::set_client_gamepad_pref(launch_session->client_gamepad);
+    }
     const auto hdr_capabilities = hdr::parse_client_display_capabilities(
       find_arg(args, "maxBrightness"),
       find_arg(args, "minBrightness"),
@@ -419,6 +455,10 @@ namespace nvhttp {
                << ", PATH: " << request->path;
 
     if (verbose_flag) {
+      // Headers stay disabled because authentication and proxy headers may
+      // contain credentials. Query values are limited to protocol fields that
+      // are useful for launch diagnostics and are not client credentials.
+      /*
       // Headers
       if (!request->header.empty()) {
         log_stream << ", HEADERS: ";
@@ -429,18 +469,35 @@ namespace nvhttp {
           first = false;
         }
       }
+      */
 
-      // Query parameters
+      static constexpr std::array safe_query_parameters {
+        "appid"sv,
+        "clientname"sv,
+        "continuousAudio"sv,
+        "corever"sv,
+        "customScreenMode"sv,
+        "display_name"sv,
+        "gamepad"sv,
+        "gcmap"sv,
+        "hdrMode"sv,
+        "localAudioPlayMode"sv,
+        "mode"sv,
+        "sops"sv,
+        "surroundAudioInfo"sv,
+        "surroundParams"sv,
+        "touchKeyboard"sv,
+        "uniqueid"sv,
+        "useVdd"sv,
+      };
       auto query_params = request->parse_query_string();
-      if (!query_params.empty()) {
-        log_stream << ", PARAMS: ";
-        bool first = true;
-        for (auto &[name, val] : query_params) {
-          if (!first) log_stream << "&";
-          log_stream << name << "=" << val;
-          first = false;
-        }
-      }
+      http_util::append_allowed_request_log_fields(
+        log_stream,
+        ", PARAMS: "sv,
+        query_params,
+        safe_query_parameters,
+        "&"sv
+      );
     }
     BOOST_LOG(debug) << log_stream.str();
   }
@@ -454,7 +511,8 @@ namespace nvhttp {
   template <class T>
   void
   print_request_warning_ip(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, const std::string &message) {
-    BOOST_LOG(warning) << message << " [" << request->query_string << "] from IP: " << request->remote_endpoint().address().to_string() << ", Port: " << request->remote_endpoint().port();
+    // Query strings may contain launch keys, so warnings only include routing context.
+    BOOST_LOG(warning) << message << " from IP: " << request->remote_endpoint().address().to_string() << ", Port: " << request->remote_endpoint().port();
   }
 
   template <class T>
@@ -645,6 +703,7 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     const auto launch_session = make_launch_session(host_audio, args);
+    const rtsp_stream::launch_preparation_guard_t launch_preparation;
     launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
     const auto fingerprint_match = client_fingerprint::match_client(args);
     launch_session->highly_suspected_unknown_client = fingerprint_match.suspicious;
@@ -813,6 +872,11 @@ namespace nvhttp {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
     const auto launch_session = make_launch_session(host_audio, args);
+    const rtsp_stream::launch_preparation_guard_t launch_preparation;
+    if (launch_session->width <= 0 || launch_session->height <= 0 || launch_session->fps <= 0) {
+      BOOST_LOG(warning) << "Resume request has no usable mode; keeping the current display resolution and refresh rate for compatibility. "sv
+                            "Update Moonlight-Switch to a version that sends mode on Resume when one is available."sv;
+    }
     launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
     const auto fingerprint_match = client_fingerprint::match_client(args);
     launch_session->highly_suspected_unknown_client = fingerprint_match.suspicious;
@@ -1028,7 +1092,7 @@ namespace nvhttp {
     bool host_audio {};
 
     auto bind_address = net::get_bind_address(address_family);
-    auto is_file_mapping_client_paired = [](std::string_view client_uuid) {
+    auto is_client_paired = [](std::string_view client_uuid) {
       if (client_uuid.empty()) {
         return false;
       }
@@ -1049,8 +1113,47 @@ namespace nvhttp {
     file_mapping_config.certificate_file = config::nvhttp.cert;
     file_mapping_config.private_key_file = config::nvhttp.pkey;
     file_mapping_config.mappings_json = config::nvhttp.file_mappings;
-    file_mapping_config.authorize_client = is_file_mapping_client_paired;
+    file_mapping_config.authorize_client = is_client_paired;
     file_mapping_service.start(std::move(file_mapping_config));
+
+    // USB forwarding requires explicit host opt-in. Credentials are generated
+    // per service lifetime and delivered only over the paired HTTPS connection.
+    remote_usb::reverse_tunnel_service reverse_tunnel_service;
+    std::string usb_forwarding_token;
+    bool usb_forwarding_available = false;
+    if (config::nvhttp.usb_forwarding_enabled) {
+      std::array<unsigned char, 32> token_bytes {};
+      if (RAND_bytes(token_bytes.data(), static_cast<int>(token_bytes.size())) == 1) {
+        usb_forwarding_token = util::hex_vec(token_bytes);
+        remote_usb::reverse_tunnel_config tunnel_config;
+        tunnel_config.bind_address = bind_address.empty() ? "0.0.0.0" : bind_address;
+        // Resolve after the main port has been parsed. Its validated range
+        // reserves +21 for RTSP, so +7 cannot overflow a uint16_t.
+        tunnel_config.port = config::nvhttp.usb_forwarding_port != 0
+          ? config::nvhttp.usb_forwarding_port : net::map_port(7);
+        tunnel_config.session_token = usb_forwarding_token;
+        tunnel_config.certificate_file = config::nvhttp.cert;
+        tunnel_config.private_key_file = config::nvhttp.pkey;
+        tunnel_config.verify_client_cert = [](X509 *cert) {
+          return pairing::verify_client_certificate(cert, false) == nullptr;
+        };
+        // Optional USB forwarding must never claim a core TCP listener first.
+        const auto tunnel_port = tunnel_config.port;
+        const bool reserved_port = tunnel_port == port_http || tunnel_port == port_https ||
+          tunnel_port == net::map_port(confighttp::PORT_HTTPS) ||
+          tunnel_port == net::map_port(rtsp_stream::RTSP_SETUP_PORT);
+        if (!reserved_port) {
+          usb_forwarding_available = reverse_tunnel_service.start(std::move(tunnel_config));
+        }
+        else {
+          BOOST_LOG(warning) << "Remote USB forwarding port conflicts with a core TCP listener";
+        }
+      }
+      if (!usb_forwarding_available) {
+        usb_forwarding_token.clear();
+        BOOST_LOG(warning) << "Remote USB forwarding unavailable";
+      }
+    }
 
     network_probe::service_t network_probe_service;
     https_server_t https_server { config::nvhttp.cert, config::nvhttp.pkey };
@@ -1111,6 +1214,32 @@ namespace nvhttp {
     https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
     https_server.resource["^/pair$"]["GET"] = pairing::pair_https;
     https_server.resource["^/applist$"]["GET"] = apps::list;
+    https_server.resource["^/api/v1/usb-forwarding$"]["GET"] =
+      [&](resp_https_t resp, req_https_t req) {
+        const SimpleWeb::CaseInsensitiveMultimap headers {
+          { "Content-Type", "application/json" },
+          { "Cache-Control", "no-store" },
+        };
+        // Do not trust the caller-supplied uniqueid, or relaxed TLS verification.
+        // Keep-alive identity is cached at handshake; pairing may since be revoked.
+        if (!is_client_paired(get_client_cert_uuid_from_request(req))) {
+          resp->write(SimpleWeb::StatusCode::client_error_unauthorized,
+            "{\"error\":\"pairing_required\"}", headers);
+          return;
+        }
+        nlohmann::json body {
+          { "version", 1 },
+          { "enabled", config::nvhttp.usb_forwarding_enabled },
+          { "available", usb_forwarding_available },
+          { "reason", !config::nvhttp.usb_forwarding_enabled ? "disabled" :
+                        usb_forwarding_available ? "ready" : "unavailable" },
+        };
+        if (usb_forwarding_available) {
+          body["port"] = reverse_tunnel_service.bound_port();
+          body["token"] = usb_forwarding_token;
+        }
+        resp->write(SimpleWeb::StatusCode::success_ok, body.dump(), headers);
+      };
     https_server.resource["^/appasset$"]["GET"] = apps::asset;
     https_server.resource["^/displays$"]["GET"] = display_control::get_displays;
     https_server.resource["^/display-scale-options$"]["GET"] = display_scale::get_options;
@@ -1237,12 +1366,16 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
-    file_mapping_service.stop();
+    /* Stop the public HTTP listeners first.  Once their worker threads have
+     * joined, no capability request or route callback can race broker/host
+     * teardown below. */
     https_server.stop();
     http_server.stop();
-
     ssl.join();
     tcp.join();
+
+    reverse_tunnel_service.stop();
+    file_mapping_service.stop();
   }
 
 }  // namespace nvhttp

@@ -144,6 +144,7 @@ namespace config {
   struct audio_t {
     std::string sink;
     std::string virtual_sink;
+    std::string microphone_redirect_backend;
     bool stream;
     bool stream_mic;
     bool install_steam_drivers;
@@ -184,6 +185,8 @@ namespace config {
     std::string file_state;
     std::string file_mappings;
     std::uint16_t file_mapping_port;
+    bool usb_forwarding_enabled;
+    std::uint16_t usb_forwarding_port;  // 0: main port + 7; otherwise explicit override
 
     std::string external_ip;
     std::vector<std::string> resolutions;
@@ -227,6 +230,7 @@ namespace config {
     bool virtual_mouse;
     bool amf_draw_mouse_cursor;
     bool clipboard_sync;  ///< Bidirectional clipboard sync (text + single image). On by default; effective only when the user-session GUI agent is alive. Set to false to force-disable.
+    bool client_gamepad_override;  ///< Honor the client-declared controller type carried on the /launch query (Sunshine extension). On by default; set false to keep host-side selection authoritative.
   };
 
   namespace flag {
@@ -305,6 +309,14 @@ namespace config {
    */
   std::string
   get_clients_config();
+
+  /**
+   * Return the per-client touch-keyboard preference: true when the client
+   * entry exists and its touch.enabled is true.  Unknown clients and
+   * entries without a touch object default to false.
+   */
+  bool
+  get_client_touch_keyboard_enabled(const std::string &uuid);
 
   /**
    * Persist per-client settings and publish them to the running process.

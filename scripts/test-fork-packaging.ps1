@@ -1,4 +1,8 @@
-# 使用隔离的模拟运行时验证分发清单，不下载组件，也不运行测试 EXE。
+# 使用隔离副本验证分发清单，并执行上游要求的真实组件自检。
+param(
+    [string]$RuntimeDirectory = 'build/ds5-sidecar-runtime'
+)
+
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $relative = "build/fork-packaging-test-$([guid]::NewGuid().ToString('N'))"
@@ -16,13 +20,12 @@ function Assert-True([bool]$Condition, [string]$Message) {
 
 try {
     $runtime = Join-Path $testRoot 'runtime'
-    New-Item -ItemType Directory -Path $runtime -Force | Out-Null
-    [System.IO.File]::WriteAllBytes((Join-Path $runtime 'Sunshine.Ds5Sidecar.exe'), [byte[]](0x4D, 0x5A))
-    @{
-        component_version = '1.2.0'
-        protocol = 1
-        target = 'win-x64-self-contained'
-    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runtime 'runtime.json') -Encoding utf8
+    $sourceRuntime = Join-Path $root $RuntimeDirectory
+    if (-not (Test-Path -LiteralPath (Join-Path $sourceRuntime 'Sunshine.Ds5Sidecar.exe') -PathType Leaf)) {
+        throw '未找到完整的 DualSense 运行时，请先运行 scripts/build-ds5-sidecar.ps1。'
+    }
+    New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+    Copy-Item -LiteralPath $sourceRuntime -Destination $runtime -Recurse
 
     $arguments = @{
         RuntimeDirectory = "$relative/runtime"
@@ -60,8 +63,9 @@ try {
     & (Join-Path $PSScriptRoot 'write-pinned-ds5-manifest.ps1') -Output "$relative/pinned.json"
     $pinned = Get-Content -LiteralPath $pinnedPath -Raw -Encoding utf8 | ConvertFrom-Json
     Assert-True ($pinned.download_url -like 'https://github.com/AlkaidLab/foundation-sunshine/releases/download/*') '固定组件必须使用控制面板信任的上游发布地址。'
-    Assert-True ($pinned.sha256 -ceq '8ed32d2d135cc21c887dcc9b19221830cd4790b8167e165c6b01f4d41ff65423') '固定组件哈希发生意外变化。'
-    Assert-True ($pinned.size -eq 44011192) '固定组件大小发生意外变化。'
+    Assert-True ($pinned.component_version -ceq '1.3.0') '固定组件版本发生意外变化。'
+    Assert-True ($pinned.sha256 -ceq 'af0b2f2a897aee5281e602e9190825fc0e2a089266bfacce266f003ebcc87dee') '固定组件哈希发生意外变化。'
+    Assert-True ($pinned.size -eq 79235186) '固定组件大小发生意外变化。'
     Write-Host 'Fork 打包回归检查通过：仓库、标签、哈希、大小、未发布构建、错误输入及官方固定组件。'
 }
 finally {

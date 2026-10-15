@@ -9,9 +9,9 @@
 #define MyAppExeName "@CMAKE_PROJECT_NAME@.exe"
 #define MyAppGUIExeName "sunshine-gui.exe"
 #define MySourceDir "@INNO_STAGING_DIR@"
-#define MyIconFile "@CMAKE_SOURCE_DIR@\sunshine.ico"
-#define MyWelcomeBmp "@CMAKE_SOURCE_DIR@\welcome.bmp"
-#define MySmallBmp "@CMAKE_SOURCE_DIR@\wizard_small.bmp"
+#define MyIconFile "@CMAKE_SOURCE_DIR@\assets\brand\sunshine.ico"
+#define MyWelcomeBmp "@CMAKE_SOURCE_DIR@\assets\installer\welcome.bmp"
+#define MySmallBmp "@CMAKE_SOURCE_DIR@\assets\installer\wizard_small.bmp"
 #define MyLicenseFile "@CMAKE_SOURCE_DIR@\LICENSE"
 
 [Setup]
@@ -208,6 +208,10 @@ Source: "{#MySourceDir}\tools\ds5-sidecar-package.json"; DestDir: "{app}\tools";
 Source: "{#MySourceDir}\tools\hdr_enhanced\nvidia_rtx_video\foundation_rtx_video_adapter.dll"; DestDir: "{app}\tools\hdr_enhanced\nvidia_rtx_video"; Flags: ignoreversion skipifsourcedoesntexist; Components: application
 Source: "{#MySourceDir}\tools\hdr_enhanced\nvidia_rtx_video\README.md"; DestDir: "{app}\tools\hdr_enhanced\nvidia_rtx_video"; Flags: ignoreversion skipifsourcedoesntexist; Components: application
 Source: "{#MySourceDir}\tools\hdr_enhanced\nvidia_rtx_video\RTX_VIDEO_THIRD_PARTY_NOTICES.md"; DestDir: "{app}\tools\hdr_enhanced\nvidia_rtx_video"; Flags: ignoreversion skipifsourcedoesntexist; Components: application
+; Optional DLSS NR adapter: first-party only, the NVIDIA runtime is never packaged.
+Source: "{#MySourceDir}\tools\hdr_enhanced\nvidia_dlssnr\foundation_dlssnr_adapter.dll"; DestDir: "{app}\tools\hdr_enhanced\nvidia_dlssnr"; Flags: ignoreversion skipifsourcedoesntexist; Components: application
+Source: "{#MySourceDir}\tools\hdr_enhanced\nvidia_dlssnr\NVIDIA-DLSS-LICENSE.txt"; DestDir: "{app}\tools\hdr_enhanced\nvidia_dlssnr"; Flags: ignoreversion skipifsourcedoesntexist; Components: application
+Source: "{#MySourceDir}\tools\hdr_enhanced\nvidia_dlssnr\NVIDIA-OPTICAL-FLOW-NOTICES.txt"; DestDir: "{app}\tools\hdr_enhanced\nvidia_dlssnr"; Flags: ignoreversion skipifsourcedoesntexist; Components: application
 
 ; Portable scripts (will be deleted during install, but needed for layout)
 Source: "{#MySourceDir}\install_portable.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: application

@@ -143,7 +143,7 @@ namespace nvhttp {
       std::mutex mutex;
     } preset_pin_state;
 
-    using args_t = SimpleWeb::CaseInsensitiveMultimap;
+    using args_t = web::CaseInsensitiveMultimap;
 
     std::string
     get_arg(const args_t &args, const char *name, const char *default_value = nullptr) {
@@ -169,7 +169,7 @@ namespace nvhttp {
 
     template <class T>
     void
-    log_request(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+    log_request(std::shared_ptr<typename web::ServerBase<T>::Request> request) {
       BOOST_LOG(debug) << "Request - Protocol: " << tunnel_name<T>()
                        << ", IP: " << request->remote_endpoint().address().to_string()
                        << ", PORT: " << request->remote_endpoint().port()
@@ -249,7 +249,7 @@ namespace nvhttp {
 
     template <class T>
     void
-    pair_impl(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+    pair_impl(std::shared_ptr<typename web::ServerBase<T>::Response> response, std::shared_ptr<typename web::ServerBase<T>::Request> request) {
       log_request<T>(request);
 
       auto client_ip = request->remote_endpoint().address().to_string();
@@ -520,7 +520,7 @@ namespace nvhttp {
 
     void
     pair_http(resp_http_t response, req_http_t request) {
-      pair_impl<SimpleWeb::HTTP>(std::move(response), std::move(request));
+      pair_impl<web::HTTP>(std::move(response), std::move(request));
     }
 
   }  // namespace pairing
@@ -595,12 +595,16 @@ namespace nvhttp {
     auto x509 = crypto::x509(conf_intern.servercert);
     auto sign = crypto::signature(x509);
     auto serversecret = crypto::rand(16);
+    auto serverchallenge = crypto::rand(16);
+    if (serversecret.size() != 16 || serverchallenge.size() != 16) {
+      fail_pair(sess, tree, "Failed to generate pairing challenge");
+      return;
+    }
 
     decrypted.insert(std::end(decrypted), std::begin(sign), std::end(sign));
     decrypted.insert(std::end(decrypted), std::begin(serversecret), std::end(serversecret));
 
     auto hash = crypto::hash({ (char *) decrypted.data(), decrypted.size() });
-    auto serverchallenge = crypto::rand(16);
 
     std::string plaintext;
     plaintext.reserve(hash.size() + serverchallenge.size());

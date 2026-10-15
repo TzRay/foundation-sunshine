@@ -113,6 +113,27 @@ namespace proc {
     }
   }
 
+  // Convert the UTF-8 configuration path with the shared platform-aware helper
+  // before passing it to Boost.Filesystem.
+  boost::filesystem::path
+  boost_path_from_utf8(std::string_view path) {
+    const auto native_path = file_handler::path_from_utf8(path);
+#ifdef _WIN32
+    return boost::filesystem::path { native_path.wstring() };
+#else
+    return boost::filesystem::path { native_path.string() };
+#endif
+  }
+
+  std::string
+  boost_path_to_utf8(const boost::filesystem::path &path) {
+#ifdef _WIN32
+    return file_handler::path_to_utf8(std::filesystem::path { path.wstring() });
+#else
+    return file_handler::path_to_utf8(std::filesystem::path { path.string() });
+#endif
+  }
+
   boost::filesystem::path
   find_working_directory(const std::string &cmd, boost::process::v1::environment &env) {
     // Parse the raw command string into parts to get the actual command portion
@@ -140,16 +161,16 @@ namespace proc {
     }
 
     // If the cmd path is not an absolute path, resolve it using our PATH variable
-    boost::filesystem::path cmd_path(parts.at(0));
+    boost::filesystem::path cmd_path = boost_path_from_utf8(parts.at(0));
     if (!cmd_path.is_absolute()) {
-      cmd_path = boost::process::v1::search_path(parts.at(0));
+      cmd_path = boost::process::v1::search_path(cmd_path);
       if (cmd_path.empty()) {
         BOOST_LOG(error) << "Unable to find executable ["sv << parts.at(0) << "]. Is it in your PATH?"sv;
         return boost::filesystem::path();
       }
     }
 
-    BOOST_LOG(debug) << "Resolved target ["sv << parts.at(0) << "] to path ["sv << cmd_path << ']';
+    BOOST_LOG(debug) << "Resolved target ["sv << parts.at(0) << "] to path ["sv << boost_path_to_utf8(cmd_path) << ']';
 
     // Now that we have a complete path, we can just use parent_path()
     return cmd_path.parent_path();
@@ -246,7 +267,7 @@ namespace proc {
 
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(cmd.do_cmd, _env) :
-                                              boost::filesystem::path(_app.working_dir);
+                                              boost_path_from_utf8(_app.working_dir);
       BOOST_LOG(info) << "Executing Do Cmd: ["sv << cmd.do_cmd << ']';
       auto child = platf::run_command(cmd.elevated, true, cmd.do_cmd, working_dir, _env, _pipe.get(), ec, nullptr);
 
@@ -281,8 +302,8 @@ namespace proc {
     for (auto &cmd : _app.detached) {
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(cmd, _env) :
-                                              boost::filesystem::path(_app.working_dir);
-      BOOST_LOG(info) << "Spawning ["sv << cmd << "] in ["sv << working_dir << ']';
+                                              boost_path_from_utf8(_app.working_dir);
+      BOOST_LOG(info) << "Spawning ["sv << cmd << "] in ["sv << boost_path_to_utf8(working_dir) << ']';
       auto child = platf::run_command(_app.elevated, true, cmd, working_dir, _env, _pipe.get(), ec, nullptr);
       if (ec) {
         BOOST_LOG(warning) << "Couldn't spawn ["sv << cmd << "]: System: "sv << ec.message();
@@ -299,8 +320,8 @@ namespace proc {
     else {
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(_app.cmd, _env) :
-                                              boost::filesystem::path(_app.working_dir);
-      BOOST_LOG(info) << "Executing: ["sv << _app.cmd << "] in ["sv << working_dir << ']';
+                                              boost_path_from_utf8(_app.working_dir);
+      BOOST_LOG(info) << "Executing: ["sv << _app.cmd << "] in ["sv << boost_path_to_utf8(working_dir) << ']';
       _process = platf::run_command(_app.elevated, true, _app.cmd, working_dir, _env, _pipe.get(), ec, &_process_group);
       if (ec) {
         BOOST_LOG(warning) << "Couldn't run ["sv << _app.cmd << "]: System: "sv << ec.message();
@@ -372,7 +393,7 @@ namespace proc {
 
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(cmd.undo_cmd, _env) :
-                                              boost::filesystem::path(_app.working_dir);
+                                              boost_path_from_utf8(_app.working_dir);
       BOOST_LOG(info) << "Executing Undo Cmd: ["sv << cmd.undo_cmd << ']';
       auto child = platf::run_command(cmd.elevated, true, cmd.undo_cmd, working_dir, _env, _pipe.get(), ec, nullptr);
 
@@ -512,6 +533,18 @@ namespace proc {
     return iter == _apps.end() ? std::nullopt : iter->rtx_hdr;
   }
 
+  std::optional<rtsp_stream::dlssnr_config_t>
+  proc_t::get_app_dlssnr_config(int app_id) const {
+    if (_app_id == app_id && _app_id > 0) {
+      return _app.dlssnr;
+    }
+    const auto app_id_string = std::to_string(app_id);
+    const auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id_string](const auto &app) {
+      return app.id == app_id_string;
+    });
+    return iter == _apps.end() ? std::nullopt : iter->dlssnr;
+  }
+
   void
   proc_t::run_menu_cmd(std::string cmd_id) {
     auto iter = std::find_if(_app.menu_cmds.begin(), _app.menu_cmds.end(), [&cmd_id](const auto menu_cmd) {
@@ -524,7 +557,7 @@ namespace proc {
 
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(cmd, _env) :
-                                              boost::filesystem::path(_app.working_dir);
+                                              boost_path_from_utf8(_app.working_dir);
       auto child = platf::run_command(iter->elevated, true, cmd, working_dir, _env, nullptr, ec, nullptr);
       if (ec) {
         BOOST_LOG(warning) << "Couldn't run cmd ["sv << cmd << "]: System: "sv << ec.message();
@@ -957,6 +990,24 @@ namespace proc {
             .saturation = std::clamp(rtx_hdr_node->get<int>("saturation", 0), -100, 100),
             .middle_gray = std::clamp(rtx_hdr_node->get<int>("middle-gray", 50), 10, 100),
             .peak_nits = std::clamp(rtx_hdr_node->get<int>("peak-nits", 1000), 400, 1000),
+          };
+        }
+        auto dlssnr_node = app_node.get_child_optional("dlssnr"s);
+        if (dlssnr_node) {
+          const auto mode = dlssnr_node->get<std::string>("mode", "inherit");
+          if (mode != "on" && mode != "off" && mode != "inherit") {
+            BOOST_LOG(warning) << "Ignoring invalid DLSS NR mode ["sv << mode << "] for app ["sv << name << ']';
+          }
+          if (mode == "on" || mode == "off") ctx.dlssnr = rtsp_stream::dlssnr_config_t {
+            .enabled = mode == "on",
+            .style = std::clamp(dlssnr_node->get<int>("style", 0), 0, 4),
+            .motion_quality = std::clamp(dlssnr_node->get<int>("motion-quality", 0), 0, 3),
+            .intensity = std::clamp(dlssnr_node->get<float>("intensity", 1.0f), 0.0f, 1.0f),
+            .local_tone_strength = std::clamp(dlssnr_node->get<float>("local-tone-strength", 1.0f), 0.0f, 1.0f),
+            .local_structure_strength = std::clamp(dlssnr_node->get<float>("local-structure-strength", 1.0f), 0.0f, 1.0f),
+            .skin_structure_strength = std::clamp(dlssnr_node->get<float>("skin-structure-strength", 0.0f), 0.0f, 1.0f),
+            .auto_mask = dlssnr_node->get<bool>("auto-mask", false),
+            .ui_correction = dlssnr_node->get<bool>("ui-correction", false),
           };
         }
 

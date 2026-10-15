@@ -407,6 +407,97 @@ namespace platf {
     return ret;
   }
 
+  namespace {
+    /**
+     * @brief 将 GetProductInfo 返回的 SKU 映射为常见的版本名称。
+     * @return 版本名称；未知 SKU 返回空字符串。
+     */
+    std::string
+    windows_edition_name(DWORD product_type, bool is_workstation) {
+      switch (product_type) {
+        case PRODUCT_CORE:
+        case PRODUCT_HOME_BASIC:
+          return "Home";
+        case PRODUCT_CORE_N:
+          return "Home N";
+        case PRODUCT_CORE_SINGLELANGUAGE:
+          return "Home Single Language";
+        case PRODUCT_CORE_COUNTRYSPECIFIC:
+          return "Home China";
+        case PRODUCT_HOME_PREMIUM:
+          return "Home Premium";
+        case PRODUCT_PROFESSIONAL:
+        case PRODUCT_PROFESSIONAL_N:
+          return "Pro";
+        case PRODUCT_EDUCATION:
+        case PRODUCT_EDUCATION_N:
+          return "Education";
+        case PRODUCT_ENTERPRISE:
+        case PRODUCT_ENTERPRISE_N:
+          return "Enterprise";
+        case PRODUCT_ENTERPRISE_S:
+        case PRODUCT_ENTERPRISE_S_N:
+          return "Enterprise LTSC";
+        case PRODUCT_ULTIMATE:
+          return "Ultimate";
+        default:
+          break;
+      }
+      if (is_workstation) {
+        return {};
+      }
+      switch (product_type) {
+        case PRODUCT_STANDARD_SERVER:
+        case PRODUCT_STANDARD_SERVER_CORE:
+          return "Standard";
+        case PRODUCT_DATACENTER_SERVER:
+        case PRODUCT_DATACENTER_SERVER_CORE:
+          return "Datacenter";
+        case PRODUCT_SERVER_FOUNDATION:
+          return "Foundation";
+        default:
+          return {};
+      }
+    }
+  }
+
+  std::string
+  windows_version() {
+    using rtl_get_version_fn = LONG(WINAPI *)(OSVERSIONINFOEXW *);
+
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto rtl_get_version = ntdll == nullptr ? nullptr : reinterpret_cast<rtl_get_version_fn>(GetProcAddress(ntdll, "RtlGetVersion"));
+    if (rtl_get_version == nullptr) {
+      return "unknown";
+    }
+
+    OSVERSIONINFOEXW version {};
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (rtl_get_version(&version) < 0) {
+      return "unknown";
+    }
+
+    const bool is_workstation = version.wProductType == VER_NT_WORKSTATION;
+    DWORD product_type = 0;
+    GetProductInfo(version.dwMajorVersion, version.dwMinorVersion, 0, 0, &product_type);
+    const auto edition = windows_edition_name(product_type, is_workstation);
+
+    std::ostringstream result;
+    if (is_workstation) {
+      result << (version.dwBuildNumber >= 22000 ? "Windows 11" : "Windows 10");
+    }
+    else {
+      result << "Windows Server";
+    }
+    if (!edition.empty()) {
+      result << ' ' << edition;
+    }
+    result << ' ' << version.dwMajorVersion << '.'
+           << version.dwMinorVersion << '.'
+           << version.dwBuildNumber;
+    return result.str();
+  }
+
   // Note: This does NOT append a null terminator
   void
   append_string_to_environment_block(wchar_t *env_block, int &offset, const std::wstring &wstr) {
@@ -1042,6 +1133,24 @@ namespace platf {
   bp::child
   run_command(bool elevated, bool interactive, const std::string &cmd, boost::filesystem::path &working_dir, const bp::environment &env, FILE *file, std::error_code &ec, bp::group *group) {
     std::wstring start_dir = working_dir.wstring();
+
+    // Validate lpCurrentDirectory before CreateProcessW for an actionable log entry.
+    if (!start_dir.empty()) {
+      // Keep drive roots such as "C:\" intact.
+      std::wstring probe_dir = start_dir;
+      while (probe_dir.size() > 1 && (probe_dir.back() == L'\\' || probe_dir.back() == L'/') && probe_dir[probe_dir.size() - 2] != L':') {
+        probe_dir.pop_back();
+      }
+
+      const auto probe_attributes = GetFileAttributesW(probe_dir.c_str());
+      if (probe_attributes == INVALID_FILE_ATTRIBUTES ||
+          (probe_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        const auto probe_error = probe_attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_DIRECTORY;
+        BOOST_LOG(warning) << "Working directory ["sv << to_utf8(start_dir) << "] does not exist or is not accessible (error "
+                           << util::hex(probe_error).to_string_view() << ")."sv;
+      }
+    }
+
     HANDLE job = group ? group->native_handle() : nullptr;
     STARTUPINFOEXW startup_info = create_startup_info(file, job ? &job : nullptr, ec);
     PROCESS_INFORMATION process_info;

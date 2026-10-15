@@ -8,11 +8,11 @@
 // standard includes
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <filesystem>
 #include <memory>
@@ -25,7 +25,7 @@
 #include <utility>
 
 // lib includes
-#include <Simple-Web-Server/server_http.hpp>
+#include "src/http/server.h"
 #include <boost/atomic.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -41,6 +41,8 @@
 #include "client_fingerprint.h"
 #include "config.h"
 #include "confighttp.h"
+#include "ai/proxy.h"
+#include "ai/http_stream.h"
 #include "display_device/session.h"
 #include "display_device/vdd_capability.h"
 #include "file_handler.h"
@@ -48,6 +50,7 @@
 #include "file_mapping/service.h"
 #include "globals.h"
 #include "hdr/session_target.h"
+#include "image_enhancement/nr_defaults.h"
 #include "http_util.h"
 #include "httpcommon.h"
 #include "logging.h"
@@ -63,7 +66,6 @@
 #include "nvhttp/network_probe.h"
 #include "nvhttp/pairing.h"
 #include "nvhttp/sessions.h"
-#include "nvhttp/tls_client_identity_store.h"
 #include "nvhttp_stream_start.h"
 #include "platform/common.h"
 #include "platform/run_command.h"
@@ -92,144 +94,19 @@ namespace nvhttp {
   };
 
   boost::atomic<uint32_t> session_id_counter {0};
-  static boost::atomic_flag global_cancel_pending = BOOST_ATOMIC_FLAG_INIT;
+  using https_server_t = web::Server<SunshineHTTPS>;
+  using http_server_t = web::Server<web::HTTP>;
 
-  static tls_client_identity_store_t tls_client_identities;
-
-  template <class Request>
-  std::string
-  get_tls_connection_key(const std::shared_ptr<Request> &request) {
-    const auto remote = request->remote_endpoint();
-    const auto local = request->local_endpoint();
-    if (remote.port() == 0 || local.port() == 0) {
-      return {};
-    }
-
-    std::ostringstream key;
-    key << '[' << remote.address().to_string() << "]:" << remote.port()
-        << ">[" << local.address().to_string() << "]:" << local.port();
-    return key.str();
-  }
-
-  class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
-  public:
-    SunshineHTTPSServer(const std::string &certification_file, const std::string &private_key_file):
-        ServerBase<SunshineHTTPS>::ServerBase(443),
-        context(boost::asio::ssl::context::tls_server) {
-      // Disabling TLS 1.0 and 1.1 (see RFC 8996)
-      context.set_options(boost::asio::ssl::context::no_tlsv1);
-      context.set_options(boost::asio::ssl::context::no_tlsv1_1);
-      context.use_certificate_chain_file(certification_file);
-      context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
-    }
-
-    std::function<int(SSL *)> verify;
-    std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;
-
-  protected:
-    boost::asio::ssl::context context;
-
-    void
-    after_bind() override {
-      if (verify) {
-        context.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert | boost::asio::ssl::verify_client_once);
-        context.set_verify_callback([](int verified, boost::asio::ssl::verify_context &ctx) {
-          // To respond with an error message, a connection must be established
-          return 1;
-        });
-      }
-    }
-
-    // This is Server<HTTPS>::accept() with SSL validation support added
-    void
-    accept() override {
-      auto connection = create_connection(*io_service, context);
-
-      acceptor->async_accept(connection->socket->lowest_layer(), [this, connection](const SimpleWeb::error_code &ec) {
-        auto lock = connection->handler_runner->continue_lock();
-        if (!lock)
-          return;
-
-        if (ec != SimpleWeb::error::operation_aborted)
-          this->accept();
-
-        auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
-
-        if (!ec) {
-          boost::asio::ip::tcp::no_delay option(true);
-          SimpleWeb::error_code ec;
-          session->connection->socket->lowest_layer().set_option(option, ec);
-
-          session->connection->set_timeout(config.timeout_request);
-          session->connection->socket->async_handshake(boost::asio::ssl::stream_base::server, [this, session](const SimpleWeb::error_code &ec) {
-            session->connection->cancel_timeout();
-            auto lock = session->connection->handler_runner->continue_lock();
-            if (!lock)
-              return;
-            if (!ec) {
-              // Extract and store certificate UUID during handshake
-              try {
-                SSL *ssl = session->connection->socket->native_handle();
-                if (ssl) {
-                  crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
-                    SSL_get1_peer_certificate(ssl)
-#else
-                    SSL_get_peer_certificate(ssl)
-#endif
-                  };
-                  if (x509) {
-                    if (auto uuid = pairing::client_uuid_for_cert(x509.get()); !uuid.empty()) {
-                      // Client authentication belongs to the TLS connection,
-                      // not to the first HTTP Request object created for it.
-                      // Simple-Web-Server replaces Request objects between
-                      // keep-alive requests while retaining the connection.
-                      tls_client_identities.remember(
-                        get_tls_connection_key(session->request),
-                        std::weak_ptr<void>(std::static_pointer_cast<void>(session->connection)),
-                        std::move(uuid));
-                    }
-                  }
-                }
-              }
-              catch (const std::exception &e) {
-                BOOST_LOG(debug) << "Failed to extract certificate UUID during handshake: " << e.what();
-              }
-
-              if (verify && !verify(session->connection->socket->native_handle()))
-                this->write(session, on_verify_failed);
-              else
-                this->read(session);
-            }
-            else if (this->on_error)
-              this->on_error(session->request, ec);
-          });
-        }
-        else if (this->on_error)
-          this->on_error(session->request, ec);
-      });
-    }
-  };
-
-  using https_server_t = SunshineHTTPSServer;
-  using http_server_t = SimpleWeb::Server<SimpleWeb::HTTP>;
-
-  using args_t = SimpleWeb::CaseInsensitiveMultimap;
-  using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response>;
-  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request>;
-  using resp_http_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response>;
-  using req_http_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Request>;
+  using args_t = web::CaseInsensitiveMultimap;
+  using resp_https_t = std::shared_ptr<typename web::ServerBase<SunshineHTTPS>::Response>;
+  using req_https_t = std::shared_ptr<typename web::ServerBase<SunshineHTTPS>::Request>;
+  using resp_http_t = std::shared_ptr<typename web::ServerBase<web::HTTP>::Response>;
+  using req_http_t = std::shared_ptr<typename web::ServerBase<web::HTTP>::Request>;
 
   // Get the client certificate UUID authenticated on this request's TLS connection.
   std::string
   get_client_cert_uuid_from_request(req_https_t request) {
-    try {
-      return tls_client_identities.lookup(get_tls_connection_key(request));
-    }
-    catch (const std::exception &e) {
-      BOOST_LOG(debug) << "Failed to get client certificate UUID: " << e.what();
-    }
-    return "";
+    return request ? request->client_uuid : std::string {};
   }
 
   std::string
@@ -282,11 +159,33 @@ namespace nvhttp {
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
     if (launch_session->enable_hdr) {
       if (const auto app_rtx_hdr = proc::proc.get_app_rtx_hdr_config(launch_session->appid); app_rtx_hdr && app_rtx_hdr->enabled) {
-        launch_session->hdr_backend = hdr_enhanced::manager().acquire_selected();
-        if (launch_session->hdr_backend && launch_session->hdr_backend->id == hdr_enhanced::NVIDIA_RTX_VIDEO_BACKEND) {
+        launch_session->hdr_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::hdr);
+        if (launch_session->hdr_backend && launch_session->hdr_backend->id == image_enhancement::NVIDIA_RTX_VIDEO_BACKEND) {
           launch_session->synthetic_hdr = *app_rtx_hdr;
         }
       }
+    }
+    if (const auto defaults = image_enhancement::load_nr_defaults()) {
+      const auto &f = defaults->filter;
+      launch_session->dlssnr_params.enabled = defaults->enabled;
+      launch_session->dlssnr_params.intensity = f.nr_intensity;
+      launch_session->dlssnr_params.style = f.nr_style;
+      launch_session->dlssnr_params.skin_structure_strength = f.nr_skin_structure_strength;
+      launch_session->dlssnr_params.auto_mask = f.nr_auto_mask;
+      launch_session->dlssnr_params.ui_correction = f.nr_ui_correction;
+      launch_session->dlssnr_params.motion_quality = f.nr_motion_quality;
+      launch_session->dlssnr_scale_percent = f.nr_scale_percent;
+    }
+    // Explicit per-app on/off settings take precedence; inherit uses the saved
+    // stream defaults. The overlay processing scale is currently global.
+    if (const auto app_dlssnr = proc::proc.get_app_dlssnr_config(launch_session->appid)) {
+      launch_session->dlssnr_params = *app_dlssnr;
+    }
+    if (launch_session->dlssnr_params.enabled) {
+      // Reserve both enabled backends until RTSP knows the final wire format.
+      // It selects RTX HDR only for PQ and releases the unused backend;
+      // HLG/SDR must retain NR even when launch initially requested RTX HDR.
+      launch_session->dlssnr_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::nr);
     }
     launch_session->use_vdd = util::from_view(get_arg(args, "useVdd", "0"));
     launch_session->custom_screen_mode = util::from_view(get_arg(args, "customScreenMode", "-1"));
@@ -308,8 +207,6 @@ namespace nvhttp {
       if (!declared_gamepad.empty()) {
         BOOST_LOG(info) << "Client declared gamepad preference: "sv << declared_gamepad;
       }
-      // Publish for the input layer (gamepads arrive after the stream starts).
-      platf::set_client_gamepad_pref(launch_session->client_gamepad);
     }
     const auto hdr_capabilities = hdr::parse_client_display_capabilities(
       find_arg(args, "maxBrightness"),
@@ -322,23 +219,6 @@ namespace nvhttp {
                                           hdr::target_source_e::safe_defaults;
     if (!hdr_capabilities.fallback_reason.empty()) {
       BOOST_LOG(warning) << hdr_capabilities.fallback_reason << "; using safe HDR luminance defaults";
-    }
-
-    // Optional client-measured SDR reference white (moonlight-harmony extension).
-    // Parsed independently: a missing or out-of-range value simply leaves 0.
-    if (const auto sdr_white = find_arg(args, "sdrBrightness")) {
-      int parsed_sdr_white = 0;
-      const char *begin = sdr_white->data();
-      const char *end = begin + sdr_white->size();
-      const auto [position, parse_error] = std::from_chars(begin, end, parsed_sdr_white);
-      if (parse_error == std::errc {} && position == end && parsed_sdr_white >= 50 && parsed_sdr_white <= 1000) {
-        launch_session->reported_hdr_capabilities.sdr_white_nits = static_cast<float>(parsed_sdr_white);
-        launch_session->hdr_capabilities.sdr_white_nits = static_cast<float>(parsed_sdr_white);
-        BOOST_LOG(info) << "Client reported SDR white level: " << parsed_sdr_white << " nits";
-      }
-      else {
-        BOOST_LOG(warning) << "Ignoring out-of-range client SDR white level: " << *sdr_white;
-      }
     }
 
     // Get display_name from query parameter if provided
@@ -359,10 +239,16 @@ namespace nvhttp {
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
-    unsigned char raw_payload[8];
-    RAND_bytes(raw_payload, sizeof(raw_payload));
-    launch_session->av_ping_payload = util::hex_vec(raw_payload);
-    RAND_bytes((unsigned char *) &launch_session->control_connect_data, sizeof(launch_session->control_connect_data));
+    const auto random_data = crypto::rand(8 + sizeof(launch_session->control_connect_data));
+    if (random_data.size() != 8 + sizeof(launch_session->control_connect_data)) {
+      BOOST_LOG(error) << "Failed to generate launch session random data"sv;
+      return {};
+    }
+    launch_session->av_ping_payload = util::hex_vec(random_data.substr(0, 8));
+    std::memcpy(
+      &launch_session->control_connect_data,
+      random_data.data() + 8,
+      sizeof(launch_session->control_connect_data));
 
     launch_session->iv.resize(16);
     uint32_t prepend_iv = util::endian::big<uint32_t>(util::from_view(get_arg(args, "rikeyid")));
@@ -435,13 +321,13 @@ namespace nvhttp {
   };
 
   template <>
-  struct tunnel<SimpleWeb::HTTP> {
+  struct tunnel<web::HTTP> {
     static auto constexpr to_string = "NONE"sv;
   };
 
   template <class T>
   void
-  print_req(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+  print_req(std::shared_ptr<typename web::ServerBase<T>::Request> request) {
     auto debug_flag = debug.open_record();
     auto verbose_flag = verbose.open_record();
     if (!debug_flag && !verbose_flag) {
@@ -504,26 +390,26 @@ namespace nvhttp {
 
   template <class T>
   void
-  print_request_ip(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, const std::string &message) {
+  print_request_ip(std::shared_ptr<typename web::ServerBase<T>::Request> request, const std::string &message) {
     BOOST_LOG(info) << message << " from IP: " << request->remote_endpoint().address().to_string() << ", Port: " << request->remote_endpoint().port();
   }
 
   template <class T>
   void
-  print_request_warning_ip(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, const std::string &message) {
+  print_request_warning_ip(std::shared_ptr<typename web::ServerBase<T>::Request> request, const std::string &message) {
     // Query strings may contain launch keys, so warnings only include routing context.
     BOOST_LOG(warning) << message << " from IP: " << request->remote_endpoint().address().to_string() << ", Port: " << request->remote_endpoint().port();
   }
 
   template <class T>
   void
-  not_found(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+  not_found(std::shared_ptr<typename web::ServerBase<T>::Response> response, std::shared_ptr<typename web::ServerBase<T>::Request> request) {
     print_req<T>(request);
 
     // Security hardening: Return 444 for root paths to prevent probing
     if (blocked_paths.count(request->path)) {
-      *response << "HTTP/1.1 444 No Response\r\n";
       response->close_connection_after_response = true;
+      response->write(static_cast<web::StatusCode>(444));
       return;
     }
 
@@ -533,13 +419,13 @@ namespace nvhttp {
     std::ostringstream data;
 
     pt::write_xml(data, tree);
-    response->write(SimpleWeb::StatusCode::client_error_not_found, data.str());
+    response->write(web::StatusCode::not_found, data.str());
     response->close_connection_after_response = true;
   }
 
   template <class T>
   void
-  serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+  serverinfo(std::shared_ptr<typename web::ServerBase<T>::Response> response, std::shared_ptr<typename web::ServerBase<T>::Request> request) {
     print_req<T>(request);
 
     int pair_status = 0;
@@ -629,7 +515,7 @@ namespace nvhttp {
     tree.put("root.appListEtag", proc::proc.get_apps_etag());
 
     // AI capability: inform client if AI proxy is available
-    tree.put("root.AiCapability", confighttp::isAiEnabled() ? 1 : 0);
+    tree.put("root.AiCapability", ai::isAiEnabled() ? 1 : 0);
 
 #ifdef _WIN32
     tree.put("root.VddCapabilityVersion", display_device::vdd_capability::capability_version);
@@ -703,6 +589,12 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     const auto launch_session = make_launch_session(host_audio, args);
+    if (!launch_session) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 500);
+      tree.put("root.<xmlattr>.status_message", "Failed to generate launch session credentials");
+      return;
+    }
     const rtsp_stream::launch_preparation_guard_t launch_preparation;
     launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
     const auto fingerprint_match = client_fingerprint::match_client(args);
@@ -872,6 +764,12 @@ namespace nvhttp {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
     const auto launch_session = make_launch_session(host_audio, args);
+    if (!launch_session) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 500);
+      tree.put("root.<xmlattr>.status_message", "Failed to generate launch session credentials");
+      return;
+    }
     const rtsp_stream::launch_preparation_guard_t launch_preparation;
     if (launch_session->width <= 0 || launch_session->height <= 0 || launch_session->fps <= 0) {
       BOOST_LOG(warning) << "Resume request has no usable mode; keeping the current display resolution and refresh rate for compatibility. "sv
@@ -986,41 +884,7 @@ namespace nvhttp {
 
     // GameStream 的 /cancel 表示退出当前应用，而普通断开由 RTSP/控制通道处理。
     // 清理可能需要等待编码器和应用退出，不能阻塞 NVHTTP 工作线程。
-    if (!global_cancel_pending.test_and_set(boost::memory_order_acq_rel)) {
-      BOOST_LOG(info) << "Global app cancel accepted; stopping all streaming sessions asynchronously"sv;
-      rtsp_stream::terminate_sessions_async(stream::session::stop_reason_e::client_cancel, []() {
-        auto clear_pending = util::fail_guard([]() {
-          global_cancel_pending.clear(boost::memory_order_release);
-        });
-
-        try {
-          if (proc::proc.running() > 0) {
-            proc::proc.terminate();
-          }
-        }
-        catch (const std::exception &e) {
-          BOOST_LOG(error) << "Failed to terminate the running application during app cancel: "sv << e.what();
-        }
-        catch (...) {
-          BOOST_LOG(error) << "Failed to terminate the running application during app cancel"sv;
-        }
-
-        try {
-          display_device::session_t::get().restore_state();
-        }
-        catch (const std::exception &e) {
-          BOOST_LOG(error) << "Failed to restore display state during app cancel: "sv << e.what();
-        }
-        catch (...) {
-          BOOST_LOG(error) << "Failed to restore display state during app cancel"sv;
-        }
-
-        BOOST_LOG(info) << "Global app cancel cleanup finished"sv;
-      });
-    }
-    else {
-      BOOST_LOG(debug) << "Global app cancel is already in progress"sv;
-    }
+    stream::session::request_global_cancel("Global app cancel"sv);
   }
 
   void
@@ -1122,8 +986,8 @@ namespace nvhttp {
     std::string usb_forwarding_token;
     bool usb_forwarding_available = false;
     if (config::nvhttp.usb_forwarding_enabled) {
-      std::array<unsigned char, 32> token_bytes {};
-      if (RAND_bytes(token_bytes.data(), static_cast<int>(token_bytes.size())) == 1) {
+      const auto token_bytes = crypto::rand(32);
+      if (token_bytes.size() == 32) {
         usb_forwarding_token = util::hex_vec(token_bytes);
         remote_usb::reverse_tunnel_config tunnel_config;
         tunnel_config.bind_address = bind_address.empty() ? "0.0.0.0" : bind_address;
@@ -1195,6 +1059,8 @@ namespace nvhttp {
       return verified;
     };
 
+    https_server.identify = [](X509 *cert) { return pairing::client_uuid_for_cert(cert); };
+
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
       pt::ptree tree;
       auto g = util::fail_guard([&]() {
@@ -1216,14 +1082,14 @@ namespace nvhttp {
     https_server.resource["^/applist$"]["GET"] = apps::list;
     https_server.resource["^/api/v1/usb-forwarding$"]["GET"] =
       [&](resp_https_t resp, req_https_t req) {
-        const SimpleWeb::CaseInsensitiveMultimap headers {
+        const web::CaseInsensitiveMultimap headers {
           { "Content-Type", "application/json" },
           { "Cache-Control", "no-store" },
         };
         // Do not trust the caller-supplied uniqueid, or relaxed TLS verification.
         // Keep-alive identity is cached at handshake; pairing may since be revoked.
         if (!is_client_paired(get_client_cert_uuid_from_request(req))) {
-          resp->write(SimpleWeb::StatusCode::client_error_unauthorized,
+          resp->write(web::StatusCode::unauthorized,
             "{\"error\":\"pairing_required\"}", headers);
           return;
         }
@@ -1238,7 +1104,7 @@ namespace nvhttp {
           body["port"] = reverse_tunnel_service.bound_port();
           body["token"] = usb_forwarding_token;
         }
-        resp->write(SimpleWeb::StatusCode::success_ok, body.dump(), headers);
+        resp->write(web::StatusCode::ok, body.dump(), headers);
       };
     https_server.resource["^/appasset$"]["GET"] = apps::asset;
     https_server.resource["^/displays$"]["GET"] = display_control::get_displays;
@@ -1263,7 +1129,7 @@ namespace nvhttp {
 
     https_server.resource["^/api/v1/file-mapping/capability$"]["GET"] =
       [&](resp_https_t resp, req_https_t req) {
-        auto header_value = [](const SimpleWeb::CaseInsensitiveMultimap &headers, const std::string &name) {
+        auto header_value = [](const web::CaseInsensitiveMultimap &headers, const std::string &name) {
           auto it = headers.find(name);
           return it == headers.end() ? std::string {} : it->second;
         };
@@ -1314,14 +1180,8 @@ namespace nvhttp {
     // threads keep the listener responsive under such conditions.
     https_server.config.thread_pool_size = 4;
 
-    // A transport error ends the authenticated connection context. Expired
-    // identities for any other connections are pruned opportunistically too.
-    https_server.on_error = [](req_https_t request, const SimpleWeb::error_code & /*ec*/) {
-      tls_client_identities.forget(get_tls_connection_key(request));
-    };
-
-    http_server.default_resource["GET"] = not_found<SimpleWeb::HTTP>;
-    http_server.resource["^/serverinfo$"]["GET"] = serverinfo<SimpleWeb::HTTP>;
+    http_server.default_resource["GET"] = not_found<web::HTTP>;
+    http_server.resource["^/serverinfo$"]["GET"] = serverinfo<web::HTTP>;
     http_server.resource["^/pair$"]["GET"] = pairing::pair_http;
 
     http_server.config.reuse_address = true;
@@ -1369,6 +1229,7 @@ namespace nvhttp {
     /* Stop the public HTTP listeners first.  Once their worker threads have
      * joined, no capability request or route callback can race broker/host
      * teardown below. */
+    ai::http::shutdown_streams();
     https_server.stop();
     http_server.stop();
     ssl.join();

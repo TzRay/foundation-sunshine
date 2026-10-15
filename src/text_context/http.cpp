@@ -9,6 +9,7 @@
 #include <optional>
 #include <sstream>
 
+#include <boost/atomic.hpp>
 #include <nlohmann/json.hpp>
 
 #include "bridge.h"
@@ -18,8 +19,10 @@ namespace text_context::http {
   namespace {
     constexpr std::size_t kMaxBodyBytes = 4096;
 
-    void write_json(resp_https_t &resp, SimpleWeb::StatusCode status, const nlohmann::json &body) {
-      SimpleWeb::CaseInsensitiveMultimap headers;
+    boost::atomic_uint8_t last_capability_state {0xff};
+
+    void write_json(resp_https_t &resp, web::StatusCode status, const nlohmann::json &body) {
+      web::CaseInsensitiveMultimap headers;
       headers.emplace("Content-Type", "application/json");
       resp->write(status, body.dump(), headers);
     }
@@ -87,21 +90,39 @@ namespace text_context::http {
       if (!auth(resp, req)) return;
       nlohmann::json body;
       if (!read_json(req, body)) {
-        write_json(resp, SimpleWeb::StatusCode::client_error_bad_request, {{"error", "invalid_body"}});
+        write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_body"}});
         return;
       }
       auto &bridge = text_context::bridge_t::instance();
       try {
-        bridge.notify_gui_alive(body.value("input_pane", false), body.value("uia", false));
+        const auto input_pane = body.at("input_pane").get<bool>();
+        const auto uia = body.at("uia").get<bool>();
+        const auto agent_present = body.at("agent").get<bool>();
+        const auto observer_active = body.at("observer_active").get<bool>();
+        const auto generation = body.at("generation").get<std::uint64_t>();
+        const auto agent_id = body.at("agent_id").get<std::string>();
+        if (agent_id.empty() || generation == 0) {
+          write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_body"}});
+          return;
+        }
+        bridge.notify_gui_alive(input_pane, uia, agent_present, observer_active,
+                                generation, agent_id);
       }
       catch (const nlohmann::json::exception &) {
-        write_json(resp, SimpleWeb::StatusCode::client_error_bad_request, {{"error", "invalid_body"}});
+        write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_body"}});
         return;
       }
-      BOOST_LOG(debug) << "Remote text context GUI capability: input_pane="
-                      << bridge.input_pane_available() << ", uia=" << bridge.uia_available();
-      write_json(resp, SimpleWeb::StatusCode::success_ok, {
-        {"ok", true}, {"input_pane", bridge.input_pane_available()}, {"uia", bridge.uia_available()},
+      const auto input_pane_available = bridge.input_pane_available();
+      const auto uia_available = bridge.uia_available();
+      const auto capability_state = static_cast<std::uint8_t>((input_pane_available ? 0x01 : 0) |
+                                                               (uia_available ? 0x02 : 0));
+      if (last_capability_state.exchange(capability_state, boost::memory_order_relaxed) != capability_state) {
+        BOOST_LOG(debug) << "Remote text context GUI capability: input_pane="
+                         << input_pane_available << ", uia=" << uia_available;
+      }
+      write_json(resp, web::StatusCode::ok, {
+        {"ok", true}, {"agent", bridge.gui_alive()},
+        {"input_pane", input_pane_available}, {"uia", uia_available},
       });
     };
 
@@ -109,17 +130,23 @@ namespace text_context::http {
       if (!auth(resp, req)) return;
       nlohmann::json body;
       if (!read_json(req, body)) {
-        write_json(resp, SimpleWeb::StatusCode::client_error_bad_request, {{"error", "invalid_body"}});
+        write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_body"}});
         return;
       }
       text_context::observation_t observation;
       std::string source;
       try {
+        observation.agent_id = body.at("agent_id").get<std::string>();
+        observation.generation = body.at("generation").get<std::uint64_t>();
+        if (observation.agent_id.empty() || observation.generation == 0) {
+          write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_body"}});
+          return;
+        }
         source = body.value("source", std::string {});
         if (source == "input_pane") observation.source = text_context::source_e::input_pane;
         else if (source == "uia") observation.source = text_context::source_e::uia;
         else {
-          write_json(resp, SimpleWeb::StatusCode::client_error_bad_request, {{"error", "invalid_source"}});
+          write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_source"}});
           return;
         }
         observation.active = body.value("active", false);
@@ -130,23 +157,25 @@ namespace text_context::http {
         observation.auto_show = body.value("auto_show", false);
         if (!read_rect(body, "element_rect", observation.element_rect) ||
             !read_rect(body, "caret_rect", observation.caret_rect)) {
-          write_json(resp, SimpleWeb::StatusCode::client_error_bad_request, {{"error", "invalid_body"}});
+          write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_body"}});
           return;
         }
       }
       catch (const nlohmann::json::exception &) {
-        write_json(resp, SimpleWeb::StatusCode::client_error_bad_request, {{"error", "invalid_body"}});
+        write_json(resp, web::StatusCode::bad_request, {{"error", "invalid_body"}});
         return;
       }
 
       auto &bridge = text_context::bridge_t::instance();
       const bool matched = bridge.observe(observation);
-      BOOST_LOG(debug) << "Remote text context observation: source=" << source
-                      << ", active=" << observation.active
-                      << ", editable=" << observation.editable
-                      << ", has_element_rect=" << observation.element_rect.has_value()
-                      << ", matched=" << matched;
-      write_json(resp, SimpleWeb::StatusCode::success_accepted, {{"ok", true}, {"matched", matched}});
+      if (matched) {
+        BOOST_LOG(debug) << "Remote text context observation: source=" << source
+                         << ", active=" << observation.active
+                         << ", editable=" << observation.editable
+                         << ", has_element_rect=" << observation.element_rect.has_value()
+                         << ", matched=" << matched;
+      }
+      write_json(resp, web::StatusCode::accepted, {{"ok", true}, {"matched", matched}});
     };
   }
 }  // namespace text_context::http

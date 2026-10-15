@@ -44,8 +44,7 @@ namespace ds5_config::api {
     };
 
     bool same_values(const settings_t &left, const settings_t &right) noexcept {
-      return left.enabled == right.enabled &&
-             left.audio_haptics == right.audio_haptics &&
+      return left.audio_haptics == right.audio_haptics &&
              left.legacy_strength == right.legacy_strength &&
              left.legacy_curve == right.legacy_curve &&
              left.legacy_noise_gate == right.legacy_noise_gate &&
@@ -57,7 +56,7 @@ namespace ds5_config::api {
       stream.imbue(std::locale::classic());
       stream << "\"ds5-v1-" << std::dec << settings.revision << '-'
              << (persisted ? '1' : '0') << '-'
-             << (settings.enabled ? '1' : '0') << (settings.audio_haptics ? '1' : '0')
+             << (settings.audio_haptics ? '1' : '0')
              << (settings.genshin_compatibility ? '1' : '0')
              << '-' << std::hex << std::setfill('0')
              << std::setw(16) << std::bit_cast<std::uint64_t>(settings.legacy_strength)
@@ -110,8 +109,8 @@ namespace ds5_config::api {
       return revision == (std::numeric_limits<std::uint64_t>::max)() ? 1 : revision + 1;
     }
 
-    SimpleWeb::CaseInsensitiveMultimap json_headers(std::string_view entity_tag = {}) {
-      SimpleWeb::CaseInsensitiveMultimap headers {
+    web::CaseInsensitiveMultimap json_headers(std::string_view entity_tag = {}) {
+      web::CaseInsensitiveMultimap headers {
         {"Content-Type", "application/json"},
         {"Cache-Control", "no-store"},
         {"X-Content-Type-Options", "nosniff"},
@@ -124,7 +123,7 @@ namespace ds5_config::api {
 
     void write_json(
       resp_https_t response,
-      SimpleWeb::StatusCode status,
+      web::StatusCode status,
       const json &body,
       std::string_view entity_tag = {}
     ) {
@@ -139,7 +138,7 @@ namespace ds5_config::api {
 
     void write_error(
       resp_https_t response,
-      SimpleWeb::StatusCode status,
+      web::StatusCode status,
       const char *message,
       const char *error_code = nullptr
     ) {
@@ -156,7 +155,6 @@ namespace ds5_config::api {
         {"applied", true},
         {"persisted", persisted},
         {"revision", settings.revision},
-        {"ds5_enabled", settings.enabled},
         {"ds5_audio_haptics", settings.audio_haptics},
         {"ds5_legacy_haptics_strength", settings.legacy_strength},
         {"ds5_legacy_haptics_curve", settings.legacy_curve},
@@ -168,8 +166,7 @@ namespace ds5_config::api {
     }
 
     bool parse_settings(const json &input, settings_t &settings) {
-      if (!input.is_object() || input.size() != 6 ||
-          !input.contains("ds5_enabled") || !input["ds5_enabled"].is_boolean() ||
+      if (!input.is_object() || input.size() != 5 ||
           !input.contains("ds5_audio_haptics") || !input["ds5_audio_haptics"].is_boolean() ||
           !input.contains("ds5_legacy_haptics_strength") || !input["ds5_legacy_haptics_strength"].is_number() ||
           !input.contains("ds5_legacy_haptics_curve") || !input["ds5_legacy_haptics_curve"].is_number() ||
@@ -178,7 +175,6 @@ namespace ds5_config::api {
         return false;
       }
       settings = {
-        input["ds5_enabled"].get<bool>(),
         input["ds5_audio_haptics"].get<bool>(),
         input["ds5_legacy_haptics_strength"].get<double>(),
         input["ds5_legacy_haptics_curve"].get<double>(),
@@ -216,7 +212,7 @@ namespace ds5_config::api {
       if (state.disk_status == load_status_t::INVALID) {
         write_error(
           std::move(response),
-          SimpleWeb::StatusCode::server_error_internal_server_error,
+          web::StatusCode::internal_server_error,
           "Failed to read DualSense configuration",
           "ds5_config_invalid"
         );
@@ -224,7 +220,7 @@ namespace ds5_config::api {
       }
       write_json(
         std::move(response),
-        SimpleWeb::StatusCode::success_ok,
+        web::StatusCode::ok,
         settings_json(state.settings, state.persisted),
         state.entity_tag
       );
@@ -238,7 +234,7 @@ namespace ds5_config::api {
       if (request->content.size() > MAX_REQUEST_SIZE) {
         write_error(
           std::move(response),
-          SimpleWeb::StatusCode::client_error_payload_too_large,
+          web::StatusCode::payload_too_large,
           "Request body is too large"
         );
         return;
@@ -249,7 +245,7 @@ namespace ds5_config::api {
       if (input.is_discarded() || !parse_settings(input, requested)) {
         write_error(
           std::move(response),
-          SimpleWeb::StatusCode::client_error_bad_request,
+          web::StatusCode::bad_request,
           "Invalid DualSense configuration"
         );
         return;
@@ -264,12 +260,11 @@ namespace ds5_config::api {
         case update_status_t::APPLIED:
           BOOST_LOG(info) << "DualSense configuration saved and hot-applied at revision "
                           << result.state.settings.revision
-                          << " (enabled=" << result.state.settings.enabled
-                          << ", audio_haptics=" << result.state.settings.audio_haptics
+                          << " (audio_haptics=" << result.state.settings.audio_haptics
                           << ", genshin_compatibility=" << result.state.settings.genshin_compatibility << ')';
           write_json(
             std::move(response),
-            SimpleWeb::StatusCode::success_ok,
+            web::StatusCode::ok,
             settings_json(result.state.settings, true, true),
             result.state.entity_tag
           );
@@ -280,7 +275,7 @@ namespace ds5_config::api {
                            << "; no file write was needed";
           write_json(
             std::move(response),
-            SimpleWeb::StatusCode::success_ok,
+            web::StatusCode::ok,
             settings_json(result.state.settings, result.state.persisted, false),
             result.state.entity_tag
           );
@@ -288,7 +283,7 @@ namespace ds5_config::api {
         case update_status_t::PRECONDITION_REQUIRED:
           write_json(
             std::move(response),
-            SimpleWeb::StatusCode::client_error_precondition_required,
+            web::StatusCode::precondition_required,
             precondition_error_json(
               "Query DualSense configuration before saving",
               "ds5_precondition_required",
@@ -299,7 +294,7 @@ namespace ds5_config::api {
         case update_status_t::PRECONDITION_FAILED:
           write_json(
             std::move(response),
-            SimpleWeb::StatusCode::client_error_precondition_failed,
+            web::StatusCode::precondition_failed,
             precondition_error_json(
               "DualSense configuration changed; query it again before saving",
               "ds5_precondition_failed",
@@ -310,7 +305,7 @@ namespace ds5_config::api {
         case update_status_t::INVALID_PRECONDITION:
           write_json(
             std::move(response),
-            SimpleWeb::StatusCode::client_error_bad_request,
+            web::StatusCode::bad_request,
             precondition_error_json(
               "Invalid If-Match header",
               "ds5_if_match_invalid",
@@ -321,7 +316,7 @@ namespace ds5_config::api {
         case update_status_t::INVALID_SETTINGS:
           write_error(
             std::move(response),
-            SimpleWeb::StatusCode::client_error_bad_request,
+            web::StatusCode::bad_request,
             "Invalid DualSense configuration"
           );
           return;
@@ -329,7 +324,7 @@ namespace ds5_config::api {
           BOOST_LOG(error) << "DualSense configuration file could not be read; save was rejected";
           write_error(
             std::move(response),
-            SimpleWeb::StatusCode::server_error_internal_server_error,
+            web::StatusCode::internal_server_error,
             "Failed to read DualSense configuration",
             "ds5_config_invalid"
           );
@@ -338,7 +333,7 @@ namespace ds5_config::api {
           BOOST_LOG(error) << "DualSense configuration could not be written to disk";
           write_error(
             std::move(response),
-            SimpleWeb::StatusCode::server_error_internal_server_error,
+            web::StatusCode::internal_server_error,
             "Failed to write DualSense configuration"
           );
           return;
@@ -346,7 +341,7 @@ namespace ds5_config::api {
           BOOST_LOG(error) << "DualSense configuration could not be published to the runtime";
           write_error(
             std::move(response),
-            SimpleWeb::StatusCode::server_error_internal_server_error,
+            web::StatusCode::internal_server_error,
             "Failed to apply DualSense configuration"
           );
           return;
@@ -358,7 +353,7 @@ namespace ds5_config::api {
       try {
         write_error(
           std::move(response),
-          SimpleWeb::StatusCode::server_error_internal_server_error,
+          web::StatusCode::internal_server_error,
           "DualSense request failed"
         );
       }

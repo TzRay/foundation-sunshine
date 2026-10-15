@@ -35,7 +35,7 @@
 #include "webhook/webhook.h"
 #include "webhook/webhook_auth.h"
 #include "ds5/config.h"
-#include "hdr_enhanced/config.h"
+#include "image_enhancement/config.h"
 
 #ifdef _WIN32
   #include "platform/windows/misc.h"
@@ -199,8 +199,6 @@ int
 main(int argc, char *argv[]) {
   lifetime::argv = argv;
 
-  task_pool_util::TaskPool::task_id_t force_shutdown = nullptr;
-
 #ifdef _WIN32
   // Note: this only fires on a normal `return` from main. If the program
   // crashes mid-run (uncaught exception, AV, abort/terminate), atexit is
@@ -258,6 +256,7 @@ main(int argc, char *argv[]) {
   if (is_running_as_system_user) {
     BOOST_LOG(info) << "Running as SYSTEM user (service mode)";
   }
+  BOOST_LOG(info) << "Running with " << platf::windows_version();
 #endif
 
   // Log publisher metadata
@@ -270,7 +269,9 @@ main(int argc, char *argv[]) {
     bool first = true;
     for (auto &[name, val] : config::modified_config_settings) {
       if (!first) config_json << ", ";
-      config_json << "\"" << name << "\": \"" << val << "\"";
+      // 凭证类配置只记录键名,不回显明文
+      const auto logged_val = name == "widget_token" ? "<redacted>"s : val;
+      config_json << "\"" << name << "\": \"" << logged_val << "\"";
       first = false;
     }
     config_json << "}";
@@ -394,29 +395,11 @@ main(int argc, char *argv[]) {
 
   // Create signal handler after logging has been initialized
   auto shutdown_event = mail::man->event<bool>(mail::shutdown);
-  on_signal(SIGINT, [&force_shutdown, shutdown_event]() {
-    BOOST_LOG(info) << "Interrupt handler called"sv;
-
-    auto task = []() {
-      BOOST_LOG(fatal) << "10 seconds passed, yet Sunshine's still running: Forcing shutdown"sv;
-      logging::log_flush();
-      lifetime::debug_trap();
-    };
-    force_shutdown = task_pool.pushDelayed(task, 10s).task_id;
-
+  on_signal(SIGINT, [shutdown_event]() {
     shutdown_event->raise(true);
   });
 
-  on_signal(SIGTERM, [&force_shutdown, shutdown_event]() {
-    BOOST_LOG(info) << "Terminate handler called"sv;
-
-    auto task = []() {
-      BOOST_LOG(fatal) << "10 seconds passed, yet Sunshine's still running: Forcing shutdown"sv;
-      logging::log_flush();
-      lifetime::debug_trap();
-    };
-    force_shutdown = task_pool.pushDelayed(task, 10s).task_id;
-
+  on_signal(SIGTERM, [shutdown_event]() {
     shutdown_event->raise(true);
   });
 
@@ -427,7 +410,7 @@ main(int argc, char *argv[]) {
 
   proc::refresh(config::stream.file_apps);
 
-  if (!hdr_enhanced::manager().initialize()) {
+  if (!image_enhancement::manager().initialize()) {
     BOOST_LOG(warning) << "HDR enhancement configuration or selected component is unavailable; optional processing is disabled";
   }
 
@@ -445,7 +428,7 @@ main(int argc, char *argv[]) {
   }
   if (ds5_settings_result.status == ds5_config::load_status_t::INVALID ||
       !ds5_config::configure(std::move(ds5_settings_result.settings))) {
-    BOOST_LOG(error) << "DualSense configuration is invalid; DualSense emulation is disabled"sv;
+    BOOST_LOG(error) << "DualSense configuration is invalid; using default DualSense settings"sv;
     ds5_config::configure({});
   }
 #endif
@@ -504,7 +487,7 @@ main(int argc, char *argv[]) {
     upnp_unmap = upnp::start();
   });
 
-  // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
+  // Do not start network services after shutdown has already been requested.
   if (shutdown_event->peek()) {
     return lifetime::desired_exit_code;
   }
@@ -591,6 +574,10 @@ main(int argc, char *argv[]) {
 #endif
 
   mainThreadLoop(shutdown_event);
+
+  // Cover tray/HTTP requests and signals before any cleanup can block.
+  lifetime::start_shutdown_watchdog();
+  BOOST_LOG(info) << "Shutdown requested; allowing up to 10 seconds for cleanup"sv;
 
   client_fingerprint_deinit_guard.reset();
 

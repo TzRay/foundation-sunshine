@@ -13,7 +13,7 @@
 
 - 主流水线使用 `.node-version` 和锁文件，构建 .NET 10 DualSense 组件，执行 Web UI、原生和 VDD 检查。
 - 主流水线只上传 Actions 产物，不创建 Release，也不依赖上游机器人令牌或特定合并策略。
-- CI 仍编译本次源码中的 Sidecar，以验证 .NET 工程；安装包则固定使用与上游基线 `8f56f61f` 对应的官方预发布 `v2026.1015.51059.杂鱼` 组件（1.3.0）、文件大小和 SHA-256。
+- CI 仍编译本次源码中的 Sidecar，以验证 .NET 工程；安装包则固定使用与上游基线 `c211d711` 对应的官方预发布 `v2026.1022.73334.杂鱼` 组件（1.4.3）、文件大小和 SHA-256。
 - RTX HDR 可选 SDK 沿用上游的仓库权限判断；当前 Fork 构建关闭该组件，普通 SDR/HDR 编码不受影响。
 - 控制面板当前只信任 `AlkaidLab/foundation-sunshine` 的组件下载路径，因此不能将清单直接改为 Fork 地址。升级上游基线时必须同步核验并更新 `write-pinned-ds5-manifest.ps1`。
 - 缺少 `DRIVER_DOWNLOAD_TOKEN` 时仍可构建，但缺失的私有驱动不会包含在安装包中。

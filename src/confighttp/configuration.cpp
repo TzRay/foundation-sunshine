@@ -6,6 +6,7 @@
 
 #include "configuration.h"
 #include "src/config.h"
+#include "src/globals.h"
 #include "src/confighttp/auth.h"
 #include "src/confighttp/common.h"
 #include "src/display_device/session.h"
@@ -15,6 +16,7 @@
 #include "src/logging.h"
 #include "src/nvenc/frame_budget.h"
 #include "src/nvhttp.h"
+#include "src/network.h"
 #include "src/platform/common.h"
 #include "src/utility.h"
 #include "src/video.h"
@@ -31,6 +33,41 @@ namespace confighttp::configuration {
   using namespace confighttp;
 
   namespace {
+    void
+    getListeners(resp_https_t response, req_https_t request) {
+      if (!authenticate(response, request)) return;
+      json output {
+        { "status", true },
+        { "addresses", json::array() },
+        { "active", {
+          { "bind_address", config::sunshine.bind_address },
+          { "address_family", config::sunshine.address_family },
+          { "port", config::sunshine.port },
+          { "upnp", static_cast<bool>(config::sunshine.flags[config::flag::UPNP]) },
+        } },
+      };
+      try {
+        const auto snapshot = config::get_config_snapshot();
+        if (!snapshot) throw std::runtime_error("Unable to read saved listener settings");
+        const auto value = [&](const std::string &key, const std::string &fallback) {
+          const auto found = snapshot->find(key);
+          return found == snapshot->end() ? fallback : found->second;
+        };
+        const auto upnp = value("upnp", "disabled");
+        output["saved"] = {
+          { "bind_address", value("bind_address", "") },
+          { "address_family", value("address_family", "ipv4") },
+          { "port", std::stoi(value("port", "47989")) },
+          { "upnp", upnp == "enabled" || upnp == "true" || upnp == "1" },
+        };
+        for (const auto &address : net::local_addresses()) output["addresses"].push_back({ { "name", address.name }, { "address", address.address } });
+      }
+      catch (const std::exception &error) {
+        output["status"] = false;
+        output["error"] = error.what();
+      }
+      send_response(response, output);
+    }
     void
     getConfig(resp_https_t response, req_https_t request) {
       if (!authenticate(response, request)) return;
@@ -78,6 +115,13 @@ namespace confighttp::configuration {
       }
       outputTree.put("widget_token_configured", !config::sunshine.widget_token.empty());
 
+#ifdef _WIN32
+      const auto vsync = nvprefs_instance.status();
+      outputTree.put("nvidia_vsync.supported", vsync.supported);
+      outputTree.put("nvidia_vsync.detection_known", vsync.detection_known);
+      outputTree.put("nvidia_vsync.state", vsync.state);
+      outputTree.put("nvidia_vsync.version", 1);
+#endif
       outputTree.put("active_encoder", video::active_encoder_name());
       if (auto frame_budget = nvenc::get_frame_budget_report()) {
         pt::ptree budget_node;
@@ -240,6 +284,14 @@ namespace confighttp::configuration {
 
       try {
         pt::read_json(ss, inputTree);
+        net::validate_bind_address(inputTree.get<std::string>("bind_address", ""), inputTree.get<std::string>("address_family", "ipv4"));
+        const auto port_value = inputTree.get<std::string>("port", "47989");
+        std::size_t consumed = 0;
+        const auto port = std::stoi(port_value, &consumed);
+        if (consumed != port_value.size() || port < 1029 || port > 65514) throw std::invalid_argument("port must be between 1029 and 65514");
+        if (const auto upnp = inputTree.get_optional<std::string>("upnp"); upnp && *upnp != "enabled" && *upnp != "disabled" && *upnp != "true" && *upnp != "false") {
+          throw std::invalid_argument("invalid upnp value");
+        }
         std::string resArray = inputTree.get<std::string>("resolutions", "[]");
         std::string fpsArray = inputTree.get<std::string>("fps", "[]");
         std::string gpu_name = inputTree.get<std::string>("adapter_name", "");
@@ -293,6 +345,7 @@ namespace confighttp::configuration {
     server.resource["^/api/gamepad/config$"]["GET"] = getGamepadConfig;
     server.resource["^/api/gamepad/config$"]["POST"] = saveGamepadConfig;
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
+    server.resource["^/api/network/listeners$"]["GET"] = getListeners;
   }
 
 }  // namespace confighttp::configuration

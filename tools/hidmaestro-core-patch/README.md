@@ -1,41 +1,85 @@
 # Foundation HIDMaestro Core patch
 
-This is a downstream managed-code patch for foundation-sunshine #1138. The
-upstream v1.7.3 API and assembly/file versions are preserved. The patched Core
-ships inside Sidecar component version 1.3.0, together with its runtime and
-licenses. The Control Panel updates installed older components through its
-existing package verification, staging and rollback flow when streaming is idle.
-The sidecar uses normal .NET dependency loading and rejects a missing patch
-marker before any SDK operation. Sunshine never replaces a DLL at launch.
+Sidecar component 1.4.2 uses HIDMaestro v1.12.0 with managed-code patches for
+device-cleanup ownership, USB audio pacing, externally managed USB/IP and
+DualSense report metadata. The v1.12.0 API, assembly/file versions and all
+official embedded resources are preserved. The complete component includes Core,
+runtime, licenses and notices; the Control Panel uses verified staging and
+whole-component rollback. Sidecar checks the exact runtime version and
+`FoundationCorePatch=device-ownership-1` before any SDK operation, even probing.
 
-Foundation uses a Joystick UMDF2 persona and USB/IP composite personas. Neither
-needs a global GameInput mapping or a shared Joystick OEM override. This build
-therefore disables **all** default VID/PID-wide GameInput and OEM writes, including
-the unused legacy Game Pad path. It retains per-controller registry configuration.
-Launch recovery and full cleanup preserve shared OEM/slot settings. Device
-parameter and interface cleanup require SDK ownership, and an unknown parent is
-not accepted as proof of ownership of a phantom HID child.
+Upstream v1.12.0 replaces the old registry-isolation patch's GameInput/OEM/slot
+changes. JSON profiles receive no GameInput table. The upstream ledger captures
+and restores OEM names, preserves foreign OEM/axis settings and limits slot
+cleanup to identities created by virtual devices. It also removes old GameInput
+tables only when their entire contents match the legacy SDK template. We no
+longer disable these upstream writers or cleanup paths.
 
-`registry-isolation.patch` is applied exactly to the source commit and archive
-hash in `upstream.json`. `scripts/build-hidmaestro-core-patch.ps1` extracts every
-embedded resource from the separately hash-verified upstream release and
-rebuilds only C# code. No WDK or native-driver rebuild is needed. Build validation
-compares the entire public API and every embedded resource byte for byte, then
-tests both Joystick and Game Pad registry writers in a process-local redirected
-registry hive. Driver deployment, PnP cleanup and live device creation are not
-run by these tests.
+`device-ownership.patch` retains the remaining stricter cleanup rules:
 
-The release ZIP's digest binds the complete component, including signed Core.
-Installation records its executable and Core digests for probing and rollback.
-There is no separately shipped Core patch manifest or runtime activation manager.
-Preserve the upstream MIT license and third-party notices when distributing it.
-The original source is available at
-https://github.com/hifihedgehog/HIDMaestro/tree/00b7303f8533c3fe10687a765c84e929b34a5e9c.
+- Interface keys under shared ROOT/SWD enumerators require a positive SDK
+  ownership record, or an interface instance snapshot captured before parent
+  removal. Both launch cleanup and full cleanup keep this evidence local to
+  the sweep. A missing devnode does not establish ownership.
+- HID child ownership is captured before parent removal. The later orphan
+  sweep requires that snapshot or a positively owned parent; an unknown or
+  missing parent alone is insufficient.
 
-Existing, unowned GameInput mappings are deliberately preserved. Older SDKs did
-not record their original values or ownership, so deleting by VID/PID or guessing
-from a template would risk destroying another controller's configuration.
-Previously deleted OEM/axis settings cannot be reconstructed without a backup.
+The patch applies to the exact source commit and archive digest in
+`upstream.json`. `scripts/build-hidmaestro-core-patch.ps1` extracts all embedded
+resources from the separately hash-verified official release and rebuilds only
+C# code. No upstream build targets, WDK or native-driver rebuild are needed.
+Validation compares the public API, assembly identity and every embedded
+resource against the v1.12.0 release. Registry regressions run in a redirected,
+disposable HKCU hive and exercise JSON mappings, exact legacy-table removal,
+foreign edits, OEM claim/release, interface cleanup and HID ownership evidence.
+They do not deploy drivers or remove PnP devices.
 
-When upstream ships an equivalent fix, verify the shared-setting paths and ABI
-before removing this patch. A version bump alone does not establish equivalence.
+The component ZIP digest binds the whole package. Installation records the
+executable and Core digests for probing and rollback. Preserve the upstream MIT
+license and notices when distributing it. Previously deleted calibration/axis
+values cannot be reconstructed without a backup. Upstream's legacy mapping
+cleanup cannot restore a Windows mapping an older SDK already deleted.
+
+Before dropping the remaining patch, verify that upstream cleanup also rejects
+unknown-parent HID children and shared interface keys without ownership proof.
+Source: https://github.com/hifihedgehog/HIDMaestro/tree/v1.12.0
+
+`usb-audio-pacing.patch` replaces the audio pump's 200-microsecond spin tail
+with a full-deadline wait on its existing high-resolution timer. New work and
+shutdown still interrupt the wait; timer failures use a blocking fallback.
+Stream cursors, PCM handling and uncapped HID input remain unchanged.
+
+`managed-usbip.patch` makes `UsbipDriverInstaller.EnsureInstalled` a read-only
+guard. Both device creation and the SDK's explicit USB/IP install method reach
+this guard; neither can install, restart, replace, or stamp the shared driver.
+`HIDMAESTRO_KEEP_TRANSPORT=1` is insufficient upstream: it suppresses legacy
+replacement but still permits initial installation and devnode restart.
+
+The single compatibility contract is the GUI submodule's
+`src-tauri/component-compatibility.json`. GUI policy, build-time upstream ABI/
+driver/installer hash checks, and the embedded Sidecar/Core contract use it.
+The original 394 resources remain byte-identical; one contract resource is added.
+The extra `FoundationUsbipPolicy=externally-managed-v1` marker prevents an older
+driver-deploying Core from being mistaken for the managed runtime.
+
+`dualsense-reports.patch` adds the profile semantic `deviceTimestamp` for a
+32-bit, 3 MHz host QPC clock. `DualSenseClock.cs` is compiled into both Core and
+Sidecar: device and sensor timestamps share an epoch regardless of device setup
+time. Device time is read during report encoding; sensor time is captured only
+when Sidecar initializes its state or receives motion. Both wrap naturally.
+The two bundled USB profiles also declare the 32-bit report sequence at byte 12,
+device time at byte 49 and USB-connected status `0x08` at byte 54. Other profiles
+retain their existing encoding. There is no input timer or merge window.
+Sidecar requires `FoundationDualSenseReports=host-clock-v1` so an older Core
+cannot silently encode the new timestamp semantic as zero. Build checks cover
+both profiles, clock epochs, counter rollover, button edges and motion bytes.
+These corrections do not preserve Android hardware sample times across the
+network or establish the cause of Genshin camera jumps; that needs game testing.
+
+Upgrade acceptance requires an idle host and no imported USB devices. Before
+activating the staged component, the installer performs two composite
+attach/detach cycles and checks that the shared tools/driver still match the
+contract and no imports remain. Failed acceptance leaves the active component
+untouched; a system-driver repair is an explicit manager operation rather than
+a component-directory rollback. Unverified newer transport versions are rejected.

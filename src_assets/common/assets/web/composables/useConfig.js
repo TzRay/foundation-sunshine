@@ -3,6 +3,7 @@ import { trackEvents } from '../config/firebase.js'
 import { getBootstrapConfig } from '../config/bootstrapData.js'
 import { apiFetch, apiJson } from '../utils/apiFetch.js'
 import { deepClone, safeJsonParse } from '../utils/helpers.js'
+import { validateListenerSettings } from '../utils/listenerSettings.js'
 
 // 平台相关的标签页排除规则
 const PLATFORM_EXCLUSIONS = {
@@ -77,6 +78,7 @@ const DEFAULT_TABS = [
       hdr_luminance_analysis: 'auto',
       vdd_borrowed_texture: 'enabled',
       vdd_vulkan_hdr_bridge: 'enabled',
+      nvenc_vdd_force_vsync: 'disabled',
       display_device_prep: 'no_operation',
       vdd_reuse: 'disabled',
       resolution_change: 'automatic',
@@ -97,6 +99,7 @@ const DEFAULT_TABS = [
     options: {
       upnp: 'disabled',
       address_family: 'ipv4',
+      bind_address: '',
       port: 47989,
       origin_web_ui_allowed: 'lan',
       external_ip: '',
@@ -157,6 +160,7 @@ const DEFAULT_TABS = [
           nvenc_rate_control: 'cbr',
           nvenc_target_quality: 0,
           nvenc_realtime_hags: 'enabled',
+          nvenc_manage_driver_settings: 'enabled',
           nvenc_split_encode: 'driver_decides',
           nvenc_latency_over_power: 'enabled',
           nvenc_opengl_vulkan_on_dxgi: 'enabled',
@@ -346,6 +350,7 @@ const createRisk = (
  */
 export function useConfig() {
   const validationError = ref('')
+  const saveError = ref('')
   const platform = ref('')
   const saved = ref(false)
   const restarted = ref(false)
@@ -438,6 +443,8 @@ export function useConfig() {
       configData.amd_avcodec_compat = normalizeEnabledDisabledValue(configData.amd_avcodec_compat)
       configData.amd_hevc_gop_size = parseHevcGopSize(configData.amd_hevc_gop_size) ?? -1
       configData.fec_auto = normalizeEnabledDisabledValue(configData.fec_auto)
+      configData.nvenc_manage_driver_settings = normalizeEnabledDisabledValue(configData.nvenc_manage_driver_settings)
+      configData.nvenc_vdd_force_vsync = normalizeEnabledDisabledValue(configData.nvenc_vdd_force_vsync)
       config.value = configData
 
       fillDefaultValues()
@@ -612,6 +619,9 @@ export function useConfig() {
     saved.value = false
     restarted.value = false
     validationError.value = ''
+    saveError.value = ''
+    validationError.value = validateListenerSettings(config.value)
+    if (validationError.value) return false
     if (parseHevcGopSize(config.value.amd_hevc_gop_size ?? -1) === undefined) {
       validationError.value = 'config.amd_hevc_gop_size_desc'
       return false
@@ -636,11 +646,13 @@ export function useConfig() {
       if (saved.value) {
         trackEvents.configChanged(currentTab.value, 'save')
         saveSnapshots()
+        window.dispatchEvent(new Event('sunshine:config-saved'))
       }
 
       return saved.value
     } catch (error) {
       console.error('Save failed:', error)
+      saveError.value = error.message
       trackEvents.errorOccurred('config_save', error.message)
       return false
     }
@@ -656,16 +668,19 @@ export function useConfig() {
     const result = await save()
     if (!result) return
 
-    restarted.value = true
-    setTimeout(() => {
-      saved.value = false
-      restarted.value = false
-    }, 5000)
-
     try {
-      await apiFetch('/api/restart', { method: 'POST' })
+      const response = await apiFetch('/api/restart', { method: 'POST' })
+      // The native proxy can return 503 when Core exits before responding.
+      // Treat that expected restart response like a successful restart.
+      if (response.status !== 503 && !response.ok) throw new Error(`HTTP ${response.status}`)
+      restarted.value = true
+      setTimeout(() => {
+        saved.value = false
+        restarted.value = false
+      }, 5000)
       trackEvents.userAction('config_applied')
     } catch (error) {
+      saveError.value = error.message
       console.error('Failed to restart:', error)
     }
   }
@@ -752,6 +767,7 @@ export function useConfig() {
 
   return {
     validationError,
+    saveError,
     platform,
     saved,
     restarted,

@@ -44,6 +44,7 @@
 #include "ai/proxy.h"
 #include "ai/http_stream.h"
 #include "display_device/session.h"
+#include "display_device/parsed_config.h"
 #include "display_device/vdd_capability.h"
 #include "file_handler.h"
 #include "file_mapping/file_mapping_http.h"
@@ -296,6 +297,12 @@ namespace nvhttp {
                          const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
                          std::string_view result_node) {
     const auto result = rtsp_stream::launch_session_raise(launch_session);
+    if (result == rtsp_stream::launch_ticket_register_e::denied) {
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client disabled or unpaired");
+      tree.put(std::string { "root." } + std::string { result_node }, 0);
+      return false;
+    }
     if (result == rtsp_stream::launch_ticket_register_e::accepted ||
         result == rtsp_stream::launch_ticket_register_e::replaced) {
       return true;
@@ -641,6 +648,13 @@ namespace nvhttp {
       return;
     }
 
+#ifdef _WIN32
+    if (display_device::resolve_display_intent(config::video, *launch_session).target ==
+        display_device::display_intent_t::target_e::vdd) {
+      launch_session->nvidia_vsync_lease = nvprefs_instance.acquire_vsync();
+    }
+#endif
+
     if (appid > 0) {
       auto err = proc::proc.execute(appid, launch_session);
       if (err) {
@@ -816,6 +830,13 @@ namespace nvhttp {
       return;
     }
 
+#ifdef _WIN32
+    if (display_device::resolve_display_intent(config::video, *launch_session).target ==
+        display_device::display_intent_t::target_e::vdd) {
+      launch_session->nvidia_vsync_lease = nvprefs_instance.acquire_vsync();
+    }
+#endif
+
     if (!register_launch_ticket(tree, launch_session, "resume")) {
       return;
     }
@@ -963,7 +984,7 @@ namespace nvhttp {
 
       const auto clients = nvhttp::get_all_clients();
       for (const auto &client : clients) {
-        if (client.contains("uuid") && client["uuid"].is_string() && std::string_view { client["uuid"].get_ref<const std::string &>() } == client_uuid) {
+        if (client.value("enabled", true) && client.contains("uuid") && client["uuid"].is_string() && std::string_view { client["uuid"].get_ref<const std::string &>() } == client_uuid) {
           return true;
         }
       }

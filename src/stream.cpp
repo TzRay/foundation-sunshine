@@ -681,6 +681,7 @@ namespace stream {
     } control;
 
     std::uint32_t launch_session_id;
+    std::shared_ptr<void> nvidia_vsync_lease;
 
     // 保存 launch_session 的关键字段，用于动态参数更新
     bool enable_sops { false };
@@ -863,7 +864,7 @@ namespace stream {
     ctx.mic_socket_enabled.store(false);
 
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
-    auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
+    auto protocol = net::bind_uses_ipv4(address_family) ? udp::v4() : udp::v6();
     auto mic_port = net::map_port(MIC_STREAM_PORT);
     boost::system::error_code ec;
 
@@ -3890,7 +3891,7 @@ namespace stream {
   int
   start_broadcast(broadcast_ctx_t &ctx) {
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
-    auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
+    auto protocol = net::bind_uses_ipv4(address_family) ? udp::v4() : udp::v6();
     auto control_port = net::map_port(CONTROL_PORT);
     auto video_port = net::map_port(VIDEO_STREAM_PORT);
     auto audio_port = net::map_port(AUDIO_STREAM_PORT);
@@ -4208,6 +4209,11 @@ namespace stream {
       session.shutdown_event->raise(true);
     }
 
+    bool
+    belongs_to_client(const session_t &session, const std::string &uuid) {
+      return !uuid.empty() && session.client_cert_uuid == uuid;
+    }
+
     void
     join(session_t &session) {
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
@@ -4299,6 +4305,7 @@ namespace stream {
         }
       }
 
+      session.nvidia_vsync_lease.reset();
       perf::end_session(session.launch_session_id);
 
       // Clean up ABR state for this client
@@ -4495,6 +4502,7 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->nvidia_vsync_lease = launch_session.nvidia_vsync_lease;
       session->created_at_ms = steady_now_ms();
 
       // 设置客户端名称

@@ -63,9 +63,9 @@ try {
     & (Join-Path $PSScriptRoot 'write-pinned-ds5-manifest.ps1') -Output "$relative/pinned.json"
     $pinned = Get-Content -LiteralPath $pinnedPath -Raw -Encoding utf8 | ConvertFrom-Json
     Assert-True ($pinned.download_url -like 'https://github.com/AlkaidLab/foundation-sunshine/releases/download/*') '固定组件必须使用控制面板信任的上游发布地址。'
-    Assert-True ($pinned.component_version -ceq '1.3.0') '固定组件版本发生意外变化。'
-    Assert-True ($pinned.sha256 -ceq 'af0b2f2a897aee5281e602e9190825fc0e2a089266bfacce266f003ebcc87dee') '固定组件哈希发生意外变化。'
-    Assert-True ($pinned.size -eq 79235186) '固定组件大小发生意外变化。'
+    Assert-True ($pinned.component_version -ceq '1.4.3') '固定组件版本发生意外变化。'
+    Assert-True ($pinned.sha256 -ceq '111e43708c250b8601b94e4821f344b2e5751d777ac4300ddc7ceed50c893de4') '固定组件哈希发生意外变化。'
+    Assert-True ($pinned.size -eq 93401832) '固定组件大小发生意外变化。'
     Write-Host 'Fork 打包回归检查通过：仓库、标签、哈希、大小、未发布构建、错误输入及官方固定组件。'
 }
 finally {

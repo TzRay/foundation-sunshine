@@ -11,17 +11,17 @@ if (-not $outputPath.StartsWith($buildPrefix, [System.StringComparison]::Ordinal
     throw "拒绝在工作区 build 目录外写入 DualSense 清单：$outputPath"
 }
 
-# 此组件由上游提交 8f56f61f 对应的官方发布构建，哈希和大小已通过官方 Release 资产核验。
+# 此组件由上游提交 c211d711 对应的官方发布构建，哈希和大小已通过官方 Release 资产核验。
 $manifest = [ordered]@{
     schema = 1
-    component_version = '1.3.0'
+    component_version = '1.4.3'
     protocol = 1
     target = 'win-x64-self-contained'
     license = 'GPL-3.0-only'
     asset_name = 'Sunshine.Ds5Sidecar.x64.zip'
-    download_url = 'https://github.com/AlkaidLab/foundation-sunshine/releases/download/v2026.1015.51059.%E6%9D%82%E9%B1%BC/Sunshine.Ds5Sidecar.x64.zip'
-    sha256 = 'af0b2f2a897aee5281e602e9190825fc0e2a089266bfacce266f003ebcc87dee'
-    size = 79235186
+    download_url = 'https://github.com/AlkaidLab/foundation-sunshine/releases/download/v2026.1022.73334.%E6%9D%82%E9%B1%BC/Sunshine.Ds5Sidecar.x64.zip'
+    sha256 = '111e43708c250b8601b94e4821f344b2e5751d777ac4300ddc7ceed50c893de4'
+    size = 93401832
 }
 
 $directory = Split-Path -Parent $outputPath

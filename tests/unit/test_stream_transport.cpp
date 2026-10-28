@@ -122,16 +122,27 @@ TEST(StreamPacing, RequiresAnExactVersionedOptIn) {
   for (const auto value : { "", "1", "smooth-v2", "smooth-v1x" }) EXPECT_FALSE(streaming::smooth_pacing_requested(value));
 }
 
-TEST(StreamPacing, LateWakeDoesNotAccumulateCatchupBursts) {
+TEST(StreamPacing, LateWakeIsMeasuredWithoutAccumulatingCatchupBursts) {
   streaming::video_batch_pacer_t pacer;
   const auto start = streaming::video_batch_pacer_t::clock::now();
-  EXPECT_EQ(pacer.deadline(start), start);
+  EXPECT_EQ(pacer.deadline(start, true), start);
   pacer.sent(start, 16000);
-  EXPECT_EQ(pacer.deadline(start), start + 160us);
+  EXPECT_EQ(pacer.deadline(start, false), start + 160us);
   const auto late = start + 10ms;
-  EXPECT_EQ(pacer.deadline(late), late);
+  EXPECT_EQ(late - pacer.deadline(late, false), 9840us);
   pacer.sent(late, 16000);
-  EXPECT_EQ(pacer.deadline(late), late + 160us);
+  EXPECT_EQ(pacer.deadline(late, false), late + 160us);
+}
+
+TEST(StreamPacing, NewFrameExcludesIdleTimeButPreservesOutstandingSpacing) {
+  streaming::video_batch_pacer_t pacer;
+  const auto start = streaming::video_batch_pacer_t::clock::now();
+  pacer.sent(start, 16000);
+  EXPECT_EQ(pacer.deadline(start + 50us, true), start + 160us);
+  const auto next_frame = start + 16ms;
+  EXPECT_EQ(pacer.deadline(next_frame, true), next_frame);
+  pacer.sent(next_frame, 16000);
+  EXPECT_EQ(pacer.deadline(next_frame + 1ms, false), next_frame + 160us);
 }
 
 TEST(AudioBudget, AccountsForPcmAndFourPlusTwoAudioFec) {

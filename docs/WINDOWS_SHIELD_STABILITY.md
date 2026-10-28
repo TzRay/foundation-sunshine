@@ -75,7 +75,7 @@ macOS 返回单包发送回退。没有进行这些平台的完整产品构建�
 通过现有、已认证的 `/api/perf/current` 查看每个会话的 `transport`：
 
 - `frame_send`：完整帧的主机打包/FEC/加密/等待/发送处理耗时；按帧记录一次，不按 FEC 块重复记。
-- `pacer_lateness`：该帧等待期限的最大迟到；不是主机到客户端单程延迟。
+- `pacer_lateness`：该帧批次发送相对期限的最大迟到；平滑模式保留同一帧内已过期的期限，包含进入下一批处理前的准备/调度停顿，跨帧正常空闲不计入。不是主机到客户端单程延迟。
 - `packets_attempted`、`packets_accepted`：请求发送的数据报数量和已知被 socket 接受的数量。
 - `packets_not_confirmed`：两者之差；接受状态未知也包含在内，不能直接当作网络丢包数。
 - `fallback_batches`、`failed_batches`、`would_block_batches`、`last_batch_error`：回退、未完全确认、拥塞及最近错误。
@@ -97,6 +97,8 @@ macOS 返回单包发送回退。没有进行这些平台的完整产品构建�
 
 Windows 专用错误分类另有一项测试，由 Windows CI 执行。完整 Windows 编译与 CTest 以本 PR 的 Actions 为准。
 本地测试不能验证真实 Winsock/NIC、NVENC、Windows 定时器、HDR 显示链或 HDMI 音频路由。
+
+审查补充验证：修正平滑发送的迟到统计后，WSL 定向测试 14/14 通过，覆盖同一帧内迟到仍被记录、实际发送后重新计时，以及跨帧空闲排除与剩余批次间隔保留。原有 ThreadSanitizer 记录对应修正前版本。
 
 建议按以下顺序验收，每组至少相同场景运行 30 分钟，并回跑基线：
 

@@ -3697,7 +3697,8 @@ namespace stream {
               // Also trigger pacing before the first send_batch() of the frame
               // to account for the last send_batch() of the previous frame.
               if (session->config.smooth_video_pacing) {
-                const auto due = session->video.batch_pacer.deadline(std::chrono::steady_clock::now());
+                const auto due = session->video.batch_pacer.deadline(std::chrono::steady_clock::now(),
+                  ratecontrol_frame_packets_sent == 0);
                 const auto before_wait = std::chrono::steady_clock::now();
                 if (before_wait < due) timer->sleep_for(due - before_wait);
                 const auto started = std::chrono::steady_clock::now();

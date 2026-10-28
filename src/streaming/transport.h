@@ -29,8 +29,10 @@ namespace streaming {
   class video_batch_pacer_t {
   public:
     using clock = std::chrono::steady_clock;
-    clock::time_point deadline(clock::time_point now) const {
-      return std::max(next_, now);
+    clock::time_point deadline(clock::time_point now, bool first_batch) const {
+      // Ignore idle time between frames, but retain an overdue deadline within
+      // a frame so preparation/scheduling stalls remain visible in diagnostics.
+      return first_batch ? std::max(next_, now) : next_;
     }
     void sent(clock::time_point started, std::size_t bytes) {
       next_ = started + std::chrono::nanoseconds(bytes * 10);  // 100 MB/s

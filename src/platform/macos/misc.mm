@@ -357,10 +357,10 @@ namespace platf {
     return saddr_v6;
   }
 
-  bool
+  batch_send_result_t
   send_batch(batched_send_info_t &send_info) {
     // Fall back to unbatched send calls
-    return false;
+    return { 0, batch_send_status_e::fallback };
   }
 
   bool

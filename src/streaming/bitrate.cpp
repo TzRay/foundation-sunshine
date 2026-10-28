@@ -30,15 +30,18 @@ namespace streaming {
 
   bitrate_allocation_t
   bitrate_budget_t::allocate() const {
-    auto video_budget = requested_total_ - std::min(audio_, requested_total_ / 5);
-    video_budget -= std::min(overhead_, video_budget / 10);
+    const auto video_budget = clamp_bitrate(static_cast<std::int64_t>(requested_total_) - audio_ - overhead_);
     return { requested_total_, encoder_bitrate(video_budget, requested_fec_), requested_fec_ };
   }
 
   int
   bitrate_budget_t::request(int total) {
     std::lock_guard lock(mutex_);
-    requested_total_ = maximum_ > 0 ? std::clamp(total, 1, maximum_) : std::max(1, total);
+    const auto candidate = maximum_ > 0 ? std::clamp(total, 1, maximum_) : std::max(1, total);
+    // Audio is fixed by the negotiated format. Reject an infeasible dynamic
+    // budget instead of silently capping its reserve or raising the wire target.
+    if (static_cast<std::int64_t>(candidate) <= static_cast<std::int64_t>(audio_) + overhead_) return requested_total_;
+    requested_total_ = candidate;
     return requested_total_;
   }
 

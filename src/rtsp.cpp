@@ -45,6 +45,7 @@ extern "C" {
 #include "nvhttp.h"
 #include "rtsp.h"
 #include "stream.h"
+#include "streaming/audio_budget.h"
 #include "streaming/fec.h"
 #include "sync.h"
 #include "video.h"
@@ -1579,6 +1580,7 @@ namespace rtsp_stream {
     args.try_emplace("x-ml-audio.bitrate"sv, "0"sv);
 
     stream::config_t config;
+    config.smooth_video_pacing = session.smooth_video_pacing;
 
     std::int64_t configuredBitrateKbps;
     int client_fec = video_fec::host_preference;
@@ -1662,6 +1664,11 @@ namespace rtsp_stream {
 
       config.controlProtocolType = getArg("x-nv-general.useReliableUdp"sv);
       config.packetsize = getArg("x-nv-video[0].packetSize"sv);
+      if (config.packetsize <= static_cast<int>(sizeof(NV_VIDEO_PACKET)) || config.packetsize > 65507 - 16 - 32) {
+        BOOST_LOG(warning) << "Invalid video packet size: " << config.packetsize;
+        respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+        return;
+      }
       config.minRequiredFecPackets = getArg("x-nv-vqos[0].fec.minRequiredFecPackets"sv);
       config.mlFeatureFlags = getArg("x-ml-general.featureFlags"sv);
       BOOST_LOG(debug) << "Moonlight feature flags: 0x" << std::hex << config.mlFeatureFlags
@@ -1966,15 +1973,24 @@ namespace rtsp_stream {
     const auto total_request = has_total_request ? configuredBitrateKbps :
                                                    streaming::total_bitrate(config.monitor.bitrate, initial_fec);
     const auto audio_reserve = has_total_request ?
-                                 (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels :
+                                 streaming::audio_with_fec_kbps(audio::payload_bitrate(config.audio)) :
                                  0;
+    const auto capped_total = config::video.max_bitrate > 0 ? std::min<std::int64_t>(total_request, config::video.max_bitrate) : total_request;
+    if (has_total_request && capped_total <= audio_reserve + 500) {
+      BOOST_LOG(warning) << "Total bitrate budget " << capped_total << " Kbps cannot cover negotiated audio ("
+                         << audio_reserve << " Kbps including FEC) and transport overhead";
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
     config.monitor.bitrate_budget = std::make_shared<streaming::bitrate_budget_t>(
       static_cast<int>(std::min<std::int64_t>(total_request, std::numeric_limits<int>::max())),
       config::video.max_bitrate, audio_reserve, has_total_request ? 500 : 0,
       initial_fec, automatic_fec);
     config.monitor.bitrate = config.monitor.bitrate_budget->applied().encoder_kbps;
-    BOOST_LOG(debug) << "Session bitrate budget: " << config.monitor.bitrate_budget->total()
-                     << " Kbps, encoder: " << config.monitor.bitrate << " Kbps, FEC: " << initial_fec << '%';
+    BOOST_LOG(info) << "Session bitrate budget: " << config.monitor.bitrate_budget->total()
+                   << " Kbps, encoder: " << config.monitor.bitrate << " Kbps, FEC: " << initial_fec
+                   << "%, audio (including FEC): " << audio_reserve << " Kbps, video pacing: "
+                   << (config.smooth_video_pacing ? "smooth-v1" : "legacy");
 
     if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {
       BOOST_LOG(warning) << "HEVC is disabled, yet the client requested HEVC"sv;

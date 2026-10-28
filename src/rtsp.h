@@ -77,6 +77,7 @@ namespace rtsp_stream {
     bool enable_hdr;
     bool enable_sops;
     bool enable_mic { false };
+    bool smooth_video_pacing { false };
     bool use_vdd;
     int custom_screen_mode;
 

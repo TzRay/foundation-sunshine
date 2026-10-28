@@ -2488,12 +2488,8 @@ namespace video {
 
     auto encoded_frame = session.encode_frame(frame_nr);
     if (encoded_frame.data.empty()) {
-      // Empty data with valid frame_index means encoder needs more input (NV_ENC_ERR_NEED_MORE_INPUT).
-      // This is not an error - just return success and continue with next frame.
-      if (encoded_frame.frame_index == static_cast<uint64_t>(frame_nr)) {
-        BOOST_LOG(debug) << "NvENC: frame " << frame_nr << " buffered, waiting for more input";
-        return 0;
-      }
+      // There is no queue of retained NVENC input/output resources in this
+      // backend. Do not resubmit on the same resources after NEED_MORE_INPUT.
       BOOST_LOG(error) << "NvENC returned empty packet";
       return -1;
     }

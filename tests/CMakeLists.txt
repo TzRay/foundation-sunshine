@@ -14,6 +14,17 @@ set(INSTALL_GMOCK OFF)
 add_subdirectory("${GTEST_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/googletest")
 include_directories("${GTEST_SOURCE_DIR}/googletest/include" "${GTEST_SOURCE_DIR}")
 
+add_executable(stream_transport_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/streaming/bitrate.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_transport.cpp)
+target_include_directories(stream_transport_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(stream_transport_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+if(WIN32)
+    target_compile_definitions(stream_transport_unit_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+set_target_properties(stream_transport_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME stream_transport_unit_tests COMMAND stream_transport_unit_tests)
+
 add_executable(perf_frame_rate_unit_tests
         ${CMAKE_SOURCE_DIR}/src/streaming/perf_recorder.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_perf_frame_rates.cpp)
@@ -533,6 +544,7 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_pyrowave.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_remote_usb_host_controller.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_rtsp.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_transport.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_sunshinesvc_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_tray_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_video_probe.cpp

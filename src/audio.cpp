@@ -25,6 +25,7 @@ extern "C" {
 #include "logging.h"
 #include "platform/common.h"
 #include "thread_safe.h"
+#include "streaming/audio_budget.h"
 #include "utility.h"
 
 namespace audio {
@@ -147,12 +148,7 @@ namespace audio {
     }
 
     // Pick a sane bitrate: client value if provided, else codec defaults.
-    int bit_rate = config.bitrate;
-    if (bit_rate <= 0) {
-      bit_rate = (stream.channelCount >= 6) ? 448000 :
-                 (stream.channelCount == 2)  ? 192000 :
-                                                96000;
-    }
+    int bit_rate = streaming::encoded_audio_bitrate(stream.channelCount, config.bitrate, codec_id == AV_CODEC_ID_EAC3);
     // Clamp against codec spec maximum so a malicious / mis-configured client
     // can't ask for a bitrate that would produce a frame larger than the
     // per-shard buffer in stream.cpp (sized via MAX_AUDIO_PACKET_SIZE).
@@ -165,8 +161,8 @@ namespace audio {
     constexpr int kAc3MaxBitrate  = 640000;
     constexpr int kEac3MaxBitrate = 384000;
     const int spec_max = (codec_id == AV_CODEC_ID_EAC3) ? kEac3MaxBitrate : kAc3MaxBitrate;
-    if (bit_rate > spec_max) {
-      BOOST_LOG(warning) << codec_name << " requested bitrate "sv << bit_rate
+    if (config.bitrate > spec_max) {
+      BOOST_LOG(warning) << codec_name << " requested bitrate "sv << config.bitrate
                          << " bps exceeds spec max "sv << spec_max
                          << " bps; clamping to keep frame size within shard buffer."sv;
       bit_rate = spec_max;
@@ -669,6 +665,19 @@ namespace audio {
       return SURROUND71 + shift;
     }
     return STEREO;
+  }
+
+  int payload_bitrate(const config_t &config) {
+    const auto &stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
+    switch (config.codec) {
+      case CODEC_PCM_S16:
+        return streaming::pcm_s16_bitrate(stream.sampleRate, stream.channelCount);
+      case CODEC_AC3:
+      case CODEC_EAC3:
+        return streaming::encoded_audio_bitrate(stream.channelCount, config.bitrate, config.codec == CODEC_EAC3);
+      default:
+        return stream.bitrate;
+    }
   }
 
   int start_audio_control(audio_ctx_t &ctx) {

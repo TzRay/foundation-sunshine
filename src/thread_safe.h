@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -122,6 +123,7 @@ namespace safe {
 
     bool
     peek() {
+      std::lock_guard lg { _lock };
       return _continue && (bool) _status;
     }
 
@@ -145,6 +147,7 @@ namespace safe {
 
     [[nodiscard]] bool
     running() const {
+      std::lock_guard lg { _lock };
       return _continue;
     }
 
@@ -153,7 +156,7 @@ namespace safe {
     status_t _status { util::false_v<status_t> };
 
     std::condition_variable _cv;
-    std::mutex _lock;
+    mutable std::mutex _lock;
   };
 
   template <class T>
@@ -275,6 +278,7 @@ namespace safe {
       }
 
       if (_queue.size() == _max_elements) {
+        _dropped += _queue.size();
         _queue.clear();
       }
 
@@ -285,6 +289,7 @@ namespace safe {
 
     bool
     peek() {
+      std::lock_guard lg { _lock };
       return _continue && !_queue.empty();
     }
 
@@ -310,7 +315,7 @@ namespace safe {
     }
 
     status_t
-    pop() {
+    pop(std::uint64_t *dropped = nullptr) {
       std::unique_lock ul { _lock };
 
       if (!_continue) {
@@ -327,6 +332,12 @@ namespace safe {
 
       auto val = std::move(_queue.front());
       _queue.erase(std::begin(_queue));
+
+      // Sample the overflow counter together with the popped item. Reading it
+      // separately could hide a clear() that happens between two dequeues.
+      if (dropped) {
+        *dropped = _dropped;
+      }
 
       return val;
     }
@@ -347,14 +358,16 @@ namespace safe {
 
     [[nodiscard]] bool
     running() const {
+      std::lock_guard lg { _lock };
       return _continue;
     }
 
   private:
     bool _continue { true };
     std::uint32_t _max_elements;
+    std::uint64_t _dropped = 0;
 
-    std::mutex _lock;
+    mutable std::mutex _lock;
     std::condition_variable _cv;
 
     std::vector<T> _queue;

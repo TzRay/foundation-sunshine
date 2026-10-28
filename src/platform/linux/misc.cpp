@@ -437,7 +437,7 @@ namespace platf {
     return saddr_v6;
   }
 
-  bool
+  batch_send_result_t
   send_batch(batched_send_info_t &send_info) {
     auto sockfd = (int) send_info.native_socket;
     struct msghdr msg = {};
@@ -506,6 +506,7 @@ namespace platf {
     {
       // UDP GSO on Linux currently only supports sending 64K or 64 segments at a time
       size_t seg_index = 0;
+      int send_error = 0;
       const size_t seg_max = 65536 / 1500;
       struct iovec iovs[(send_info.headers ? std::min(seg_max, send_info.block_count) : 1) * max_iovs_per_msg] = {};
       auto msg_size = send_info.header_size + send_info.payload_size;
@@ -560,32 +561,24 @@ namespace platf {
         // actual failures and return to the caller.
         auto bytes_sent = sendmsg(sockfd, &msg, 0);
         if (bytes_sent < 0) {
-          // If there's no send buffer space, wait for some to be available
-          if (errno == EAGAIN) {
-            struct pollfd pfd;
-
-            pfd.fd = sockfd;
-            pfd.events = POLLOUT;
-
-            if (poll(&pfd, 1, -1) != 1) {
-              BOOST_LOG(warning) << "poll() failed: "sv << errno;
-              break;
-            }
-
-            // Try to send again
-            continue;
+          send_error = errno;
+          // Never block the shared real-time sender indefinitely for socket
+          // space. Preserve progress; stale packets must not be replayed.
+          if (send_error == EAGAIN) {
+            return { seg_index, batch_send_status_e::would_block, send_error };
           }
 
-          BOOST_LOG(verbose) << "sendmsg() failed: "sv << errno;
+          BOOST_LOG(verbose) << "sendmsg() failed: "sv << send_error;
           break;
         }
 
+        if (bytes_sent == 0) return { seg_index, batch_send_status_e::would_block };
         seg_index += bytes_sent / msg_size;
       }
 
       // If we sent something, return the status and don't fall back to the non-GSO path.
       if (seg_index != 0) {
-        return seg_index >= send_info.block_count;
+        return { seg_index, seg_index >= send_info.block_count ? batch_send_status_e::accepted : batch_send_status_e::fallback, send_error };
       }
     }
 #endif
@@ -620,30 +613,21 @@ namespace platf {
       while (blocks_sent < send_info.block_count) {
         int msgs_sent = sendmmsg(sockfd, &msgs[blocks_sent], send_info.block_count - blocks_sent, 0);
         if (msgs_sent < 0) {
-          // If there's no send buffer space, wait for some to be available
-          if (errno == EAGAIN) {
-            struct pollfd pfd;
-
-            pfd.fd = sockfd;
-            pfd.events = POLLOUT;
-
-            if (poll(&pfd, 1, -1) != 1) {
-              BOOST_LOG(warning) << "poll() failed: "sv << errno;
-              break;
-            }
-
-            // Try to send again
-            continue;
+          const auto error = errno;
+          if (error == EAGAIN) {
+            return { blocks_sent, batch_send_status_e::would_block, error };
           }
 
-          BOOST_LOG(warning) << "sendmmsg() failed: "sv << errno;
-          return false;
+          BOOST_LOG(warning) << "sendmmsg() failed: "sv << error;
+          return { blocks_sent, batch_send_status_e::fallback, error };
         }
+
+        if (msgs_sent == 0) return { blocks_sent, batch_send_status_e::would_block };
 
         blocks_sent += msgs_sent;
       }
 
-      return true;
+      return { blocks_sent, batch_send_status_e::accepted };
     }
   }
 

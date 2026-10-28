@@ -95,6 +95,9 @@ namespace audio {
   using packet_t = std::pair<void *, buffer_t>;
   using audio_ctx_ref_t = safe::shared_t<audio_ctx_t>::ptr_t;
 
+  // Same nominal payload rate used by the selected encoder (before audio FEC).
+  int payload_bitrate(const config_t &config);
+
   void
   capture(safe::mail_t mail, config_t config, void *channel_data);
 

@@ -232,7 +232,7 @@ TEST(VideoFecBudget, FixedZeroAndTotalRequestsShareReservesAndHostCap) {
   EXPECT_EQ(first.request(5000), 5000);
   auto next = first.pending(1002);
   ASSERT_TRUE(next);
-  EXPECT_EQ(next->encoder_kbps, 4040);
+  EXPECT_EQ(next->encoder_kbps, 3988);  // Keep the complete 512 + 500 Kbps reserve.
   EXPECT_EQ(next->fec_percentage, 0);
   EXPECT_EQ(second.total(), 10000);
   first.commit(*next);

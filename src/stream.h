@@ -53,6 +53,7 @@ namespace stream {
     int minRequiredFecPackets;
     std::shared_ptr<video_fec::controller_t> fec_control;
     bool fec_feedback = false;
+    bool smooth_video_pacing = false;
     int mlFeatureFlags;
     int controlProtocolType;
     int audioQosType;

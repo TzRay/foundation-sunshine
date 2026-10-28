@@ -53,6 +53,7 @@ extern "C" {
 #include "mic_mixer.h"
 #include "network.h"
 #include "streaming/perf_recorder.h"
+#include "streaming/transport.h"
 #include "stream.h"
 #include "sync.h"
 #include "tray/system_tray.h"
@@ -616,6 +617,8 @@ namespace stream {
 
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter;
+      streaming::encoded_queue_recovery_t queue_recovery;
+      streaming::video_batch_pacer_t batch_pacer;
 
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
@@ -3391,8 +3394,9 @@ namespace stream {
     }
 
     auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
+    std::uint64_t queue_dropped = 0;
 
-    while (auto packet = packets->pop()) {
+    while (auto packet = packets->pop(&queue_dropped)) {
       if (shutdown_event->peek()) {
         break;
       }
@@ -3400,6 +3404,25 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+      const auto network_start = std::chrono::steady_clock::now();
+      perf::transport_sample_t transport_sample;
+      transport_sample.frame_index = packet->frame_index();
+      auto record_transport = util::fail_guard([&]() {
+        perf::record_transport_sample(session->launch_session_id, transport_sample);
+      });
+      // PyroWave has its own block recovery and no legacy inter-frame chain.
+      if (session->config.monitor.videoFormat != LI_PYROWAVE_VIDEO_FORMAT) {
+        const auto recovery = session->video.queue_recovery.observe(queue_dropped, packet->is_idr());
+        transport_sample.queue_overflow = recovery.overflow;
+        transport_sample.recovery_discard = recovery.discard;
+        transport_sample.recovery_idr_requested = recovery.request_idr;
+        if (recovery.request_idr) {
+          session->video.idr_events->raise(true);
+          BOOST_LOG(warning) << "Video reference recovery: session=" << session->launch_session_id
+                             << ", frame=" << packet->frame_index() << ", queue_dropped=" << queue_dropped;
+        }
+        if (recovery.discard) continue;
+      }
       session->last_video_activity_ms.store(steady_now_ms(), std::memory_order_relaxed);
       auto lowseq = session->video.lowseq;
 
@@ -3565,7 +3588,8 @@ namespace stream {
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
         // appear in "Other I/O" and begin waiting for interrupts.
         // This gives inconsistent performance so we'd rather avoid it.
-        size_t send_batch_size = 64 * 1024 / blocksize;
+        size_t send_batch_size = streaming::video_batch_size(blocksize,
+          session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0, session->config.smooth_video_pacing);
         // Also don't exceed 64 packets, which can happen when Moonlight requests
         // unusually small packet size.
         // Generic Segmentation Offload on Linux can't do more than 64.
@@ -3672,7 +3696,18 @@ namespace stream {
               // Do pacing within the frame.
               // Also trigger pacing before the first send_batch() of the frame
               // to account for the last send_batch() of the previous frame.
-              if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms ||
+              if (session->config.smooth_video_pacing) {
+                const auto due = session->video.batch_pacer.deadline(std::chrono::steady_clock::now(),
+                  ratecontrol_frame_packets_sent == 0);
+                const auto before_wait = std::chrono::steady_clock::now();
+                if (before_wait < due) timer->sleep_for(due - before_wait);
+                const auto started = std::chrono::steady_clock::now();
+                transport_sample.pacer_lateness_ms = std::max(transport_sample.pacer_lateness_ms,
+                  std::chrono::duration<double, std::milli>(started - due).count());
+                session->video.batch_pacer.sent(started,
+                  (x - next_shard_to_send + 1) * (shards.blocksize + shards.prefixsize));
+              }
+              else if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms ||
                   ratecontrol_frame_packets_sent == 0) {
                 auto due = ratecontrol_frame_start +
                            std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
@@ -3682,6 +3717,8 @@ namespace stream {
                 if (now < due) {
                   timer->sleep_for(due - now);
                 }
+                transport_sample.pacer_lateness_ms = std::max(transport_sample.pacer_lateness_ms,
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - due).count());
 
                 ratecontrol_group_packets_sent = 0;
               }
@@ -3692,24 +3729,29 @@ namespace stream {
 
               frame_send_batch_latency_logger.first_point_now();
               // Use a batched send if it's supported on this platform
-              if (!platf::send_batch(batch_info)) {
-                // Batched send is not available, so send each packet individually
+              const auto result = platf::send_batch(batch_info);
+              transport_sample.packets_attempted += current_batch_size;
+              if (result.error) transport_sample.last_batch_error = result.error;
+              if (result.status == platf::batch_send_status_e::fallback) {
                 BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
-                for (auto y = 0; y < current_batch_size; y++) {
-                  auto send_info = platf::send_info_t {
-                    shards.prefix(next_shard_to_send + y),
-                    shards.prefixsize,
-                    shards.data(next_shard_to_send + y),
-                    shards.blocksize,
-                    (uintptr_t) sock.native_handle(),
-                    peer_address,
-                    session->video.peer.port(),
-                    session->localAddress,
-                  };
-
-                  platf::send(send_info);
-                }
+                ++transport_sample.fallback_batches;
               }
+              const auto accepted = platf::send_datagram_suffix(current_batch_size, result, [&](std::size_t y) {
+                auto send_info = platf::send_info_t {
+                  shards.prefix(next_shard_to_send + y),
+                  shards.prefixsize,
+                  shards.data(next_shard_to_send + y),
+                  shards.blocksize,
+                  (uintptr_t) sock.native_handle(),
+                  peer_address,
+                  session->video.peer.port(),
+                  session->localAddress,
+                };
+                return platf::send(send_info);
+              });
+              transport_sample.packets_accepted += accepted;
+              transport_sample.failed_batches += accepted < current_batch_size;
+              transport_sample.would_block_batches += result.status == platf::batch_send_status_e::would_block;
               frame_send_batch_latency_logger.second_point_now_and_log();
 
               ratecontrol_group_packets_sent += current_batch_size;
@@ -3723,8 +3765,6 @@ namespace stream {
                                          std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
                                            ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
 
-          frame_network_latency_logger.second_point_now_and_log();
-
           BOOST_LOG(verbose) << "Sent Frame seq ["sv << packet->frame_index() << "] pts ["sv << timestamp
                              << "] shards ["sv << shards.size() << "/"sv << shards.percentage << "%]"sv
                              << (frame_is_dupe ? " Dupe" : "")
@@ -3736,6 +3776,8 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+        frame_network_latency_logger.second_point_now_and_log();
+        transport_sample.frame_send_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - network_start).count();
       }
       catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
@@ -3847,7 +3889,7 @@ namespace stream {
           session->audio.peer.port(),
           session->localAddress,
         };
-        platf::send(send_info);
+        if (!platf::send(send_info)) perf::record_audio_send_failure(session->launch_session_id, false);
 
         auto &fec_packet = session->audio.fec_packet;
         // initialize the FEC header at the beginning of the FEC block
@@ -3874,7 +3916,7 @@ namespace stream {
               session->audio.peer.port(),
               session->localAddress,
             };
-            platf::send(send_info);
+            if (!platf::send(send_info)) perf::record_audio_send_failure(session->launch_session_id, true);
             BOOST_LOG(verbose) << "Audio FEC ["sv << (sequenceNumber & ~(RTPA_DATA_SHARDS - 1)) << ' ' << x << "] ::  send..."sv;
           }
         }

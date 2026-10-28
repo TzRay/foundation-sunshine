@@ -8,6 +8,49 @@
 
 using namespace std::chrono_literals;
 
+TEST(PerfTransport, KeepsSendFailuresSeparateFromSocketAcceptanceAndRetainsTailSamples) {
+  constexpr auto id = 92001u;
+  perf::begin_session({ id, "transport test", 3840, 2160, 60, 200000, "nvenc", "dxgi", false });
+  perf::transport_sample_t sample;
+  sample.frame_index = 42;
+  sample.frame_send_ms = 100.0;
+  sample.pacer_lateness_ms = 25.0;
+  sample.packets_attempted = 100;
+  sample.packets_accepted = 97;
+  sample.fallback_batches = 1;
+  sample.failed_batches = 1;
+  sample.would_block_batches = 1;
+  sample.last_batch_error = 10035;
+  sample.queue_overflow = true;
+  sample.recovery_discard = true;
+  sample.recovery_idr_requested = true;
+  perf::record_transport_sample(id, sample);
+  perf::record_audio_send_failure(id, false);
+  perf::record_audio_send_failure(id, true);
+  auto transport_for = [&]() -> nlohmann::json {
+    const auto snapshot = perf::current_snapshot_json();
+    for (const auto &session : snapshot["sessions"]) {
+      if (session["session_id"] == id) return session["transport"];
+    }
+    return {};
+  };
+  const auto transport = transport_for();
+  EXPECT_EQ(transport["packets_accepted"], 97);
+  EXPECT_EQ(transport["packets_not_confirmed"], 3);
+  EXPECT_EQ(transport["frame_send"]["total_samples"], 1);
+  EXPECT_EQ(transport["frame_send"]["p99_ms"], 100.0);
+  EXPECT_EQ(transport["pacer_lateness"]["max_ms"], 25.0);
+  EXPECT_EQ(transport["last_frame_index"], 42);
+  EXPECT_EQ(transport["last_batch_error"], 10035);
+  EXPECT_EQ(transport["queue_overflows"], 1);
+  EXPECT_EQ(transport["recovery_idr_requests"], 1);
+  EXPECT_EQ(transport["audio_data_failures"], 1);
+  EXPECT_EQ(transport["audio_fec_failures"], 1);
+  perf::end_session(id);
+  perf::record_transport_sample(id, sample);
+  EXPECT_EQ(transport_for()["packets_attempted"], 100);
+}
+
 namespace {
   nlohmann::json rates_for(std::uint32_t id, std::chrono::steady_clock::time_point now) {
     const auto snapshot = perf::current_snapshot_json(now);

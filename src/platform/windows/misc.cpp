@@ -42,6 +42,7 @@
 #include <Shlwapi.h>
 
 #include "misc.h"
+#include "send_batch_policy.h"
 
 #include "src/entry_handler.h"
 #include "src/globals.h"
@@ -1932,7 +1933,7 @@ namespace platf {
 
   // Use UDP segmentation offload if it is supported by the OS. If the NIC is capable, this will use
   // hardware acceleration to reduce CPU usage. Support for USO was introduced in Windows 10 20H1.
-  bool
+  batch_send_result_t
   send_batch(batched_send_info_t &send_info) {
     ensure_address_change_watcher();
 
@@ -2023,8 +2024,12 @@ namespace platf {
     // We intentionally do NOT treat a batch failure as a source-pinning failure, because an
     // unsupported-USO error is indistinguishable from an invalid-source error here; the
     // self-heal logic lives in the unbatched send() fallback path instead.
-    DWORD bytes_sent;
-    return WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR;
+    DWORD bytes_sent = 0;
+    if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) == SOCKET_ERROR) {
+      const auto error = WSAGetLastError();
+      return classify_batch_send_failure(error);
+    }
+    return { send_info.block_count, batch_send_status_e::accepted };
   }
 
   bool
@@ -2405,8 +2410,18 @@ namespace platf {
 
       LARGE_INTEGER due_time;
       due_time.QuadPart = duration.count() / -100;
-      SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, false);
-      WaitForSingleObject(timer, INFINITE);
+      if (!SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, false)) {
+        // Waiting on an unarmed timer could block the shared sender forever.
+        BOOST_LOG(warning) << "SetWaitableTimer() failed: " << GetLastError();
+        std::this_thread::sleep_for(duration);
+        return;
+      }
+      // Bound the wait even if a driver/timer fails to signal. Round up so
+      // sub-millisecond pacing still has time to reach the timer deadline.
+      const auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration + 1ms).count() + 100;
+      if (WaitForSingleObject(timer, static_cast<DWORD>(timeout_ms)) != WAIT_OBJECT_0) {
+        BOOST_LOG(warning) << "High precision timer wait did not complete";
+      }
     }
 
     operator bool() override {

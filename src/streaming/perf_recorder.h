@@ -44,6 +44,21 @@ namespace perf {
     recovery,
   };
 
+  struct transport_sample_t {
+    std::uint64_t frame_index = 0;
+    std::optional<double> frame_send_ms;
+    double pacer_lateness_ms = 0;
+    std::uint64_t packets_attempted = 0;
+    std::uint64_t packets_accepted = 0;
+    std::uint64_t fallback_batches = 0;
+    std::uint64_t failed_batches = 0;
+    std::uint64_t would_block_batches = 0;
+    bool queue_overflow = false;
+    bool recovery_discard = false;
+    bool recovery_idr_requested = false;
+    int last_batch_error = 0;
+  };
+
   void begin_session(const session_metadata_t &metadata);
   void end_session(std::uint32_t session_id);
   void update_session_bitrate(std::uint32_t session_id, int bitrate_kbps);
@@ -51,6 +66,8 @@ namespace perf {
   void record_host_latency(std::uint32_t session_id, double latency_ms, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
   void record_pipeline_sample(std::uint32_t session_id, const pipeline_sample_t &sample, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
   void record_pyrowave_failure(std::uint32_t session_id, pyrowave_failure_stage_e stage);
+  void record_transport_sample(std::uint32_t session_id, const transport_sample_t &sample);
+  void record_audio_send_failure(std::uint32_t session_id, bool fec);
 
   void record_capture_frame(std::uint32_t session_id, const std::shared_ptr<capture_source_counter_t> &source,
     std::chrono::steady_clock::time_point now = {});

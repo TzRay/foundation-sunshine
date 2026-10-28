@@ -27,6 +27,7 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/frame_contract.h"
+#include "src/platform/send_batch.h"
 #include "src/thread_safe.h"
 #include "src/utility.h"
 #include "src/video_colorspace.h"
@@ -1058,7 +1059,7 @@ namespace platf {
     }
   };
 
-  bool
+  batch_send_result_t
   send_batch(batched_send_info_t &send_info);
 
   struct send_info_t {

@@ -3,6 +3,7 @@
  * @brief Definitions for abstract platform-agnostic base of standalone NVENC encoder.
  */
 #include "nvenc_base.h"
+#include "src/nvenc/rate_control.h"
 
 #include "nvenc_utils.h"
 
@@ -369,58 +370,16 @@ namespace nvenc {
                                     config.two_pass == nvenc_two_pass::full_resolution    ? NV_ENC_TWO_PASS_FULL_RESOLUTION :
                                                                                             NV_ENC_MULTI_PASS_DISABLED;
 
-    // Configure lookahead
-    bool lookahead_supported = get_encoder_cap(NV_ENC_CAPS_SUPPORT_LOOKAHEAD) != 0;
-    bool lookahead_enabled = config.lookahead_depth > 0 && lookahead_supported;
-    enc_config.rcParams.enableLookahead = lookahead_enabled ? 1 : 0;
-    
-    if (lookahead_enabled) {
-      enc_config.rcParams.lookaheadDepth = config.lookahead_depth;
-      // Clamp lookahead depth to reasonable range (0-32)
-      if (enc_config.rcParams.lookaheadDepth > 32) {
-        enc_config.rcParams.lookaheadDepth = 32;
-        BOOST_LOG(warning) << "NvEnc: lookahead_depth clamped to 32";
-      }
-      
-      // Set lookahead level if supported (NVENC SDK 13.0+)
+    // This backend owns one in-flight input/output/event set. Lookahead needs
+    // several sets retained until completion; NEED_MORE_INPUT does not release
+    // their ownership. Keep the safe zero-lookahead path until that ring exists.
+    enc_config.rcParams.enableLookahead = 0;
+    enc_config.rcParams.lookaheadDepth = 0;
 #if NVENC_INT_VERSION >= 1202
-      if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_LOOKAHEAD_LEVEL) != 0) {
-        switch (config.lookahead_level) {
-          case nvenc_lookahead_level::disabled:
-            enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_0;
-            break;
-          case nvenc_lookahead_level::level_1:
-            enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_1;
-            break;
-          case nvenc_lookahead_level::level_2:
-            enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_2;
-            break;
-          case nvenc_lookahead_level::level_3:
-            enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_3;
-            break;
-          case nvenc_lookahead_level::autoselect:
-            enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_AUTOSELECT;
-            break;
-          default:
-            enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_0;
-            break;
-        }
-      }
-      else {
-        enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_0;
-      }
-#else
-      // Lookahead level not supported in older SDK versions, skip setting it
+    enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_0;
 #endif
-    }
-    else {
-      enc_config.rcParams.lookaheadDepth = 0;
-#if NVENC_INT_VERSION >= 1202
-      enc_config.rcParams.lookaheadLevel = NV_ENC_LOOKAHEAD_LEVEL_0;
-#endif
-      if (config.lookahead_depth > 0 && !lookahead_supported) {
-        BOOST_LOG(warning) << "NvEnc: lookahead requested but not supported by GPU";
-      }
+    if (config.lookahead_depth > 0) {
+      BOOST_LOG(warning) << "NvEnc: lookahead disabled: this backend supports one in-flight frame";
     }
 
     // Spatial AQ: enabled by default. Supported on all Maxwell-generation (2014)
@@ -907,11 +866,10 @@ namespace nvenc {
 
     NVENCSTATUS encode_status = nvenc->nvEncEncodePicture(encoder, &pic_params);
     if (encode_status == NV_ENC_ERR_NEED_MORE_INPUT) {
-      // This is not a fatal error - encoder needs more input frames before it can produce output.
-      // This can happen with B-frame reordering or lookahead. Return empty frame to signal
-      // the caller should continue without treating this as an error.
-      BOOST_LOG(debug) << "NvEnc: frame " << frame_index << " buffered (need more input)";
-      return { {}, frame_index, false, false };
+      // The caller must tear down this single-frame session, not submit the
+      // next frame using resources still owned by an unexpected buffered job.
+      BOOST_LOG(error) << "NvEnc: unexpected buffered output in single-frame mode at frame " << frame_index;
+      return {};
     }
     if (nvenc_failed(encode_status)) {
       BOOST_LOG(error) << "NvEnc: NvEncEncodePicture() failed: " << last_nvenc_error_string;
@@ -1025,34 +983,21 @@ namespace nvenc {
 
     // 复制当前配置，准备修改
     NV_ENC_CONFIG enc_config = current_enc_config;
-    enc_config.rcParams.averageBitRate = bitrate_kbps * 1000;
-    enc_config.rcParams.maxBitRate = bitrate_kbps * 1000;
-
-    // HEVC需调整VBV缓冲区应对更大码率
-    if (is_hevc) {
-      uint32_t prev_bitrate = current_enc_config.rcParams.averageBitRate;
-      uint32_t old_vbv_size = current_enc_config.rcParams.vbvBufferSize;
-      uint32_t new_vbv_size = old_vbv_size;
-
-      new_vbv_size = static_cast<uint32_t>((static_cast<uint64_t>(bitrate_kbps) * 1000 * old_vbv_size) / prev_bitrate);
-
-      // 防止VBV缓冲区过小
-      if (new_vbv_size < 1000 * 100) new_vbv_size = 1000 * 100;  // 至少100K
-      enc_config.rcParams.vbvBufferSize = new_vbv_size;
-      BOOST_LOG(debug) << "NvEnc: VBV缓冲区调整为 " << new_vbv_size / 1000 << " Kbps";
-    }
+    const auto previous_bps = enc_config.rcParams.averageBitRate;
+    const auto new_bps = static_cast<uint32_t>(bitrate_kbps) * 1000;
+    if (previous_bps == 0) return false;
+    enc_config.rcParams.maxBitRate = nvenc::rescale_rate_control(enc_config.rcParams.maxBitRate, previous_bps, new_bps);
+    enc_config.rcParams.vbvBufferSize = nvenc::rescale_rate_control(enc_config.rcParams.vbvBufferSize, previous_bps, new_bps);
+    enc_config.rcParams.vbvInitialDelay = nvenc::rescale_rate_control(enc_config.rcParams.vbvInitialDelay, previous_bps, new_bps);
+    enc_config.rcParams.averageBitRate = new_bps;
 
     // 构造重配置参数
     NV_ENC_RECONFIGURE_PARAMS reconfigure_params = { NV_ENC_RECONFIGURE_PARAMS_VER };
     reconfigure_params.reInitEncodeParams = saved_init_params;
     reconfigure_params.reInitEncodeParams.encodeConfig = &enc_config;
 
-    // HEVC码率提升时重置编码器状态
-    if (is_hevc && bitrate_kbps * 1000 > current_enc_config.rcParams.averageBitRate) {
-      BOOST_LOG(debug) << "NvEnc: HEVC码率提升，重置编码器状态";
-      reconfigure_params.resetEncoder = 1;
-      reconfigure_params.forceIDR = 1;
-    }
+    // Bitrate-only reconfiguration preserves the reference chain. Forcing an
+    // IDR on every upward FEC/bitrate adjustment adds avoidable large frames.
 
     if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
       BOOST_LOG(error) << "NvEnc: 设置码率失败(" << bitrate_kbps << " Kbps): " << last_nvenc_error_string;
@@ -1060,11 +1005,7 @@ namespace nvenc {
     }
 
     // 更新当前配置
-    current_enc_config.rcParams.averageBitRate = bitrate_kbps * 1000;
-    current_enc_config.rcParams.maxBitRate = bitrate_kbps * 1000;
-    if (is_hevc) {
-      current_enc_config.rcParams.vbvBufferSize = enc_config.rcParams.vbvBufferSize;
-    }
+    current_enc_config.rcParams = enc_config.rcParams;
 
     const char *codec_name = is_hevc ? "HEVC" : (is_av1 ? "AV1" : "AVC");
     BOOST_LOG(info) << "NvEnc: " << codec_name << " 码率已成功调整为 " << bitrate_kbps << " Kbps";

@@ -57,6 +57,7 @@
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "streaming/transport.h"
 #include "nvhttp/abr_api.h"
 #include "nvhttp/ai_api.h"
 #include "nvhttp/apps.h"
@@ -139,6 +140,7 @@ namespace nvhttp {
     std::copy(rikey.cbegin(), rikey.cend(), std::back_inserter(launch_session->gcm_key));
 
     launch_session->host_audio = host_audio;
+    launch_session->smooth_video_pacing = streaming::smooth_pacing_requested(get_arg(args, "videoPacing", ""));
     std::stringstream mode = std::stringstream(get_arg(args, "mode", "0x0x0"));
     // Split mode by the char "x", to populate width/height/fps
     int x = 0;
@@ -382,6 +384,7 @@ namespace nvhttp {
         "touchKeyboard"sv,
         "uniqueid"sv,
         "useVdd"sv,
+        "videoPacing"sv,
       };
       auto query_params = request->parse_query_string();
       http_util::append_allowed_request_log_fields(
@@ -455,6 +458,7 @@ namespace nvhttp {
     tree.put("root.appversion", VERSION);
     tree.put("root.GfeVersion", GFE_VERSION);
     tree.put("root.SunshineVersion", SUNSHINE_VERSION);
+    tree.put("root.VideoPacingModes", "smooth-v1");
     tree.put("root.uniqueid", http::unique_id);
     tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
     tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
@@ -680,6 +684,7 @@ namespace nvhttp {
                                    net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
                                    std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
     tree.put("root.gamesession", 1);
+    tree.put("root.videoPacing", launch_session->smooth_video_pacing ? "smooth-v1" : "legacy");
 
     try {
       std::map<std::string, std::string> extra_data {
@@ -846,6 +851,7 @@ namespace nvhttp {
                                    net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
                                    std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
     tree.put("root.resume", 1);
+    tree.put("root.videoPacing", launch_session->smooth_video_pacing ? "smooth-v1" : "legacy");
     need_to_restore_display_state = false;
 
     try {

@@ -63,6 +63,27 @@ namespace perf {
       frame_rate_window_t frame_rates;
       struct {
         bool enabled = false;
+        capture_source_kind_e kind = capture_source_kind_e::unavailable;
+        std::optional<frame_rate_window_t::rates_t> rates;
+      } frame_snapshot;
+      struct {
+        latency_window_t send;
+        latency_window_t pacer_lateness;
+        std::uint64_t last_frame_index = 0;
+        std::uint64_t packets_attempted = 0;
+        std::uint64_t packets_accepted = 0;
+        std::uint64_t fallback_batches = 0;
+        std::uint64_t failed_batches = 0;
+        std::uint64_t would_block_batches = 0;
+        std::uint64_t queue_overflows = 0;
+        std::uint64_t recovery_discards = 0;
+        std::uint64_t recovery_idr_requests = 0;
+        std::uint64_t audio_data_failures = 0;
+        std::uint64_t audio_fec_failures = 0;
+        int last_batch_error = 0;
+      } transport;
+      struct {
+        bool enabled = false;
         std::uint64_t frames = 0;
         std::uint64_t encode_failures = 0;
         std::uint64_t packetization_failures = 0;
@@ -227,6 +248,7 @@ namespace perf {
         result["min_ms"] = nullptr;
         result["max_ms"] = nullptr;
         result["p95_ms"] = nullptr;
+        result["p99_ms"] = nullptr;
         result["last_ms"] = nullptr;
         result["last_sample_age_ms"] = nullptr;
         result["series_ms"] = nlohmann::json::array();
@@ -255,6 +277,7 @@ namespace perf {
       result["min_ms"] = round_ms(sorted.front());
       result["max_ms"] = round_ms(sorted.back());
       result["p95_ms"] = round_ms(sorted[p95_index]);
+      result["p99_ms"] = round_ms(sorted[static_cast<std::size_t>(std::ceil(sorted.size() * 0.99)) - 1]);
       result["last_ms"] = round_ms(ordered.back());
       result["last_sample_age_ms"] = last_age;
       result["series_ms"] = nlohmann::json::array();
@@ -276,16 +299,9 @@ namespace perf {
       return result;
     }
 
-    nlohmann::json make_frame_rates_json(session_state_t &session, clock_t::time_point now) {
-      const auto generation = frame_rate_collection_epoch();
-      const bool enabled = generation && session.frame_rate_generation == generation;
-      auto kind = capture_source_kind_e::unavailable;
-      if (session.capture_source) {
-        kind = session.capture_source->kind.load(std::memory_order_relaxed);
-        if (session.active && enabled) {
-          refresh_source_total(session);
-        }
-      }
+    nlohmann::json make_frame_rates_json(const session_state_t &session) {
+      const bool enabled = session.frame_snapshot.enabled;
+      const auto kind = session.frame_snapshot.kind;
       const char *source_kind = "unavailable";
       switch (kind) {
         case capture_source_kind_e::dxgi_updates:
@@ -300,7 +316,7 @@ namespace perf {
         default:
           break;
       }
-      const auto rates = enabled ? session.frame_rates.sample(now, session.frame_counts) : std::nullopt;
+      const auto &rates = session.frame_snapshot.rates;
       nlohmann::json result = {
         { "enabled", enabled },
         { "source_kind", source_kind },
@@ -342,7 +358,25 @@ namespace perf {
       item["uptime_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>((session.active ? now : session.ended_at) - session.started_at).count();
       item["host_latency"] = make_latency_json(session.host_latency, now);
       item["pipeline"] = make_pipeline_json(session.pipeline, now);
-      item["frame_rates"] = make_frame_rates_json(session, now);
+      item["frame_rates"] = make_frame_rates_json(session);
+      const auto &transport = session.transport;
+      item["transport"] = {
+        { "frame_send", make_latency_json(transport.send, now) },
+        { "pacer_lateness", make_latency_json(transport.pacer_lateness, now) },
+        { "last_frame_index", transport.last_frame_index },
+        { "packets_attempted", transport.packets_attempted },
+        { "packets_accepted", transport.packets_accepted },
+        { "packets_not_confirmed", transport.packets_attempted - transport.packets_accepted },
+        { "fallback_batches", transport.fallback_batches },
+        { "failed_batches", transport.failed_batches },
+        { "would_block_batches", transport.would_block_batches },
+        { "queue_overflows", transport.queue_overflows },
+        { "recovery_discards", transport.recovery_discards },
+        { "recovery_idr_requests", transport.recovery_idr_requests },
+        { "audio_data_failures", transport.audio_data_failures },
+        { "audio_fec_failures", transport.audio_fec_failures },
+        { "last_batch_error", transport.last_batch_error },
+      };
       item["pyrowave"] = {
         { "enabled", session.pyrowave.enabled },
         { "frames", session.pyrowave.frames },
@@ -568,8 +602,56 @@ namespace perf {
     return { { "enabled", frame_rate_collection_epoch() != 0 }, { "subscribers", frame_rate_subscriptions.size() }, { "lease_ms", lease.count() } };
   }
 
-  nlohmann::json current_snapshot_json(clock_t::time_point now) {
+  void record_transport_sample(std::uint32_t session_id, const transport_sample_t &sample) {
     std::lock_guard lock { recorder_mutex };
+    const auto it = sessions.find(session_id);
+    if (it == sessions.end() || !it->second.active) return;
+    auto &transport = it->second.transport;
+    const auto now = clock_t::now();
+    record_optional_window_sample(transport.send, sample.frame_send_ms, now);
+    if (sample.frame_send_ms) record_window_sample(transport.pacer_lateness, sample.pacer_lateness_ms, now, false);
+    transport.last_frame_index = sample.frame_index;
+    transport.packets_attempted += sample.packets_attempted;
+    transport.packets_accepted += std::min(sample.packets_accepted, sample.packets_attempted);
+    transport.fallback_batches += sample.fallback_batches;
+    transport.failed_batches += sample.failed_batches;
+    transport.would_block_batches += sample.would_block_batches;
+    transport.queue_overflows += sample.queue_overflow;
+    transport.recovery_discards += sample.recovery_discard;
+    transport.recovery_idr_requests += sample.recovery_idr_requested;
+    if (sample.last_batch_error) transport.last_batch_error = sample.last_batch_error;
+  }
+
+  void record_audio_send_failure(std::uint32_t session_id, bool fec) {
+    std::lock_guard lock { recorder_mutex };
+    const auto it = sessions.find(session_id);
+    if (it == sessions.end() || !it->second.active) return;
+    if (fec) ++it->second.transport.audio_fec_failures;
+    else ++it->second.transport.audio_data_failures;
+  }
+
+  nlohmann::json current_snapshot_json(clock_t::time_point now) {
+    std::vector<session_state_t> snapshot;
+    std::uint32_t snapshot_latest;
+    std::size_t subscribers;
+    std::uint64_t generation;
+    {
+      std::lock_guard lock { recorder_mutex };
+      snapshot_latest = latest_session_id;
+      subscribers = frame_rate_subscriptions.size();
+      generation = frame_rate_collection_epoch();
+      snapshot.reserve(sessions.size());
+      for (auto &[id, session] : sessions) {
+        auto &rates = session.frame_snapshot;
+        rates.enabled = generation && session.frame_rate_generation == generation;
+        rates.kind = session.capture_source ? session.capture_source->kind.load(std::memory_order_relaxed) : capture_source_kind_e::unavailable;
+        if (session.active && rates.enabled) refresh_source_total(session);
+        rates.rates = rates.enabled ? session.frame_rates.sample(now, session.frame_counts) : std::nullopt;
+        snapshot.push_back(session);
+      }
+    }
+    // Sorting latency windows and constructing JSON must not block the
+    // capture/encode/send threads that append samples under recorder_mutex.
 
     nlohmann::json result;
     result["success"] = true;
@@ -578,13 +660,13 @@ namespace perf {
     result["sample_window"] = SAMPLE_WINDOW_SIZE;
     result["sessions"] = nlohmann::json::array();
     result["active_sessions"] = 0;
-    result["latest_session_id"] = latest_session_id;
+    result["latest_session_id"] = snapshot_latest;
     result["frame_rate_collection"] = {
-      { "enabled", frame_rate_collection_epoch() != 0 },
-      { "subscribers", frame_rate_subscriptions.size() },
+      { "enabled", generation != 0 },
+      { "subscribers", subscribers },
     };
 
-    for (auto &[session_id, session] : sessions) {
+    for (auto &session : snapshot) {
       if (session.active) {
         result["active_sessions"] = result["active_sessions"].get<int>() + 1;
       }

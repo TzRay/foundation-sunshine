@@ -163,6 +163,16 @@ TEST(AudioBudget, FixedAudioReserveIsNotCappedToTwentyPercent) {
   EXPECT_EQ(budget.request(30000), 30000);
 }
 
+TEST(AudioBudget, MatLiveReservesAuthenticatedFragmentsAndAudioFec) {
+  const auto payload_bps = streaming::mat_live_payload_bitrate();
+  EXPECT_EQ(payload_bps, 27648000);
+  const auto reserve_kbps = streaming::audio_with_fec_kbps(payload_bps);
+  EXPECT_EQ(reserve_kbps, 41472);
+  streaming::bitrate_budget_t budget(100000, 0, reserve_kbps, 500, 20, false);
+  EXPECT_EQ(budget.applied().encoder_kbps, 48356);
+  EXPECT_EQ(budget.request(40000), 100000);
+}
+
 TEST(NvencRateControl, PreservesPeakRatioAndVbvDurationAcrossRateChanges) {
   EXPECT_EQ(nvenc::rescale_rate_control(30000000, 20000000, 40000000), 60000000);
   EXPECT_EQ(nvenc::rescale_rate_control(333333, 20000000, 40000000), 666666);

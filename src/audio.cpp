@@ -670,6 +670,8 @@ namespace audio {
   int payload_bitrate(const config_t &config) {
     const auto &stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
     switch (config.codec) {
+      case CODEC_MAT_LIVE:
+        return streaming::mat_live_payload_bitrate();
       case CODEC_PCM_S16:
         return streaming::pcm_s16_bitrate(stream.sampleRate, stream.channelCount);
       case CODEC_AC3:

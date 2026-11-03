@@ -1,9 +1,17 @@
 #pragma once
 
+#include "third-party/moonlight-common-c/src/MatLiveCrypto.h"
+
 #include <algorithm>
 #include <cstdint>
 
 namespace streaming {
+  inline int mat_live_payload_bitrate() {
+    // Each 20 ms carrier cycle emits 60 authenticated fragments. Include the
+    // MAT envelope and GCM tag before the outer audio transport adds 4+2 FEC.
+    return MAT_LIVE_PACKET * MAT_WIRE_FRAGMENTS * 8 * 50;
+  }
+
   inline int pcm_s16_bitrate(int sample_rate, int channels) {
     return sample_rate * channels * 16;
   }

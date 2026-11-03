@@ -66,6 +66,21 @@ jobs:
           & .\src_assets\windows\misc\vdd\smoke-test-vdd-device-helper.ps1
           & .\src_assets\windows\misc\vdd\smoke-test-install-vdd-selection.ps1
 
+  mat_smoke:
+    name: MAT software regressions
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Run own-process MAT regressions
+        shell: pwsh
+        run: |
+          git submodule update --init --depth 1 third-party/moonlight-common-c
+          if ($LASTEXITCODE) { throw 'MAT dependency checkout failed' }
+          ./tools/sonic-mat-live/build.ps1 -Output build/mat-smoke -TestsOnly
+          ./tools/sonic-mat-live/test-manage-live.ps1 -Output build/mat-operator
+
   build_win:
     name: Windows
     needs: setup_release
@@ -259,6 +274,7 @@ jobs:
             -DBUILD_TESTS=ON \
             -DBUILD_TRAY_TESTS=ON \
             -DBUILD_WEB_UI=OFF \
+            -DGUI_VERSION=v0.6.7 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DSUNSHINE_ASSETS_DIR=assets \
@@ -342,76 +358,23 @@ jobs:
         uses: actions/cache@v6
         with:
           path: C:\Program Files (x86)\Inno Setup 6
-          key: inno-setup-6
+          key: inno-setup-6.7.3
 
       - name: Install Inno Setup
         if: steps.inno-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $url = "https://jrsoftware.org/download.php/is.exe"
-          $installer = Join-Path $env:RUNNER_TEMP "innosetup.exe"
-          $compiler = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          $installed = $false
-
-          for ($attempt = 1; $attempt -le 3 -and -not $installed; $attempt++) {
-            try {
-              Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
-              Write-Host "正在下载 Inno Setup，第 ${attempt}/3 次尝试。"
-              Invoke-WebRequest `
-                -Uri $url `
-                -OutFile $installer `
-                -MaximumRetryCount 2 `
-                -RetryIntervalSec 3
-
-              $file = Get-Item -LiteralPath $installer
-              if ($file.Length -lt 1MB) {
-                throw "下载文件过小：$($file.Length) 字节。"
-              }
-
-              $stream = [System.IO.File]::OpenRead($installer)
-              try {
-                if ($stream.ReadByte() -ne 0x4D -or $stream.ReadByte() -ne 0x5A) {
-                  throw "下载文件缺少有效的 Windows PE 文件头。"
-                }
-              } finally {
-                $stream.Dispose()
-              }
-
-              $process = Start-Process `
-                -FilePath $installer `
-                -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' `
-                -WindowStyle Hidden `
-                -PassThru `
-                -Wait
-              if ($process.ExitCode -ne 0) {
-                throw "Inno Setup 安装程序退出码：$($process.ExitCode)。"
-              }
-              if (-not (Test-Path -LiteralPath $compiler)) {
-                throw "安装完成后未找到 ISCC.exe。"
-              }
-
-              $installed = $true
-              Write-Host "Inno Setup 安装成功。"
-            } catch {
-              Write-Warning "Inno Setup 官方安装包处理失败：$($_.Exception.Message)"
-              if ($attempt -lt 3) {
-                Start-Sleep -Seconds 5
-              }
-            }
+          # The unversioned jrsoftware.org/download.php/is.exe link now serves an
+          # HTML page. Pin the signed release asset (6.x keeps the "Inno Setup 6"
+          # install path used below) and check its publisher before running it.
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+          $installer = "$env:TEMP\innosetup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne 'Pyrsys B.V.') {
+            throw "Unexpected Inno Setup installer signature: $($signature.Status) $($signature.SignerCertificate.Subject)"
           }
-
-          if (-not $installed) {
-            Write-Host "官方下载连续失败，改用 Chocolatey 安装 Inno Setup。"
-            choco install innosetup --yes --no-progress
-            if ($LASTEXITCODE -ne 0) {
-              throw "Chocolatey 安装 Inno Setup 失败，退出码：$LASTEXITCODE。"
-            }
-          }
-
-          if (-not (Test-Path -LiteralPath $compiler)) {
-            throw "Inno Setup 安装校验失败：未找到 $compiler。"
-          }
+          Start-Process -FilePath $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -WindowStyle Hidden -Wait
 
       - name: Add Inno Setup to PATH
         shell: pwsh

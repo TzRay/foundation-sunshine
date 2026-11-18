@@ -51,14 +51,13 @@ It starts after that user logs in; it is not a SYSTEM boot service, because
 Dolby Access package registration belongs to the user.
 
 The supervisor follows the host PID/creation time, enable/source flags, endpoint format
-and audiodg PID/creation time. It drains its owned child before starting a new
-epoch, including after a fast Sunshine restart. An enabled MAT request starts
+and audiodg PID/creation time. It waits for the previous publisher to stop and
+clean up before starting a new epoch. An enabled MAT request starts
 the installed task if absent and asks the manager to retry a failed/missing
 capture. A running capture is reused. Requests do not enable a disabled MAT
 configuration. Host acknowledgement and source preparation share a 12-second
-budget; failures still return RTSP 503. A new request, host generation or MAT
-toggle clears the failure lock; it never terminates an audio engine or unloads
-a blocked worker.
+budget. An occupied source returns RTSP 503 immediately. Incomplete worker
+cleanup or route restoration blocks replacement.
 `sunshine-plugin-mat-capture.exe --stop-manager` requests an orderly stop.
 Status and per-run logs are in `%ProgramData%\Sunshine\MAT`.
 

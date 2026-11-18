@@ -1,5 +1,18 @@
 # MAT 主机接入
 
+Sunshine 可以串流 Windows 播放端点产生的原生 Dolby MAT。配套的 Moonlight V+ 在 Android 上使用 AudioTrack 输出 IEC 载波。[Moonlight V+](https://github.com/TzRay/moonlight-vplus)
+
+1. 在 Windows 上构建并安装与主机配套的采集组件。安装程序为当前用户注册 `Sunshine MAT PCM` 管理任务。[构建与安装说明](../tools/sonic-mat-live/README.md)
+2. 在 Sunshine 音频设置中启用 MAT。转发 Windows 原生输出时选择 `mat_source = native`，并将对应播放端点配置为 Dolby Atmos for home theater。采集 48 kHz PCM 声道床时选择 `mat_source = bed`。`audio_sink` 可以是端点名称或 ID，留空时跟随默认输出。
+3. 在客户端选用实时 MAT 后建立串流。已有会话占用音源时，主机返回可重试的 `503`。冷启动使用 12 秒预算，客户端从首次 MAT `DESCRIBE` 开始共等待 15 秒。
+
+端点或混音格式变化时，主机和支持恢复的客户端可在同一视频会话中切换音频代。恢复先尝试原管道，重新唤醒管理器和取得替换源共用 10 秒预算。主动停止采集会发送 EOS，客户端排空已缓存的音频。
+
+主机状态可在 Web UI 或 `GET /api/mat/status` 查看。客户端根据播放头的实际推进报告播放和稳定状态。功放或回音壁的 Atmos 格式显示与实际听感需要在 HDMI 链路上验收。[共享协议源码](https://github.com/TzRay/moonlight-common-c)
+
+<details>
+<summary>早期手动对象采集版本的使用流程与验证记录</summary>
+
 主机沿用外置采集器和 Sunshine 的实时音频会话。采集器接收混音前对象，交给独立
 原生 MAT 编码器；Sunshine 接完整周期，经认证加密的实时音频通道发送。客户端
 当前用 mock 接收端验证契约，实际 HDMI/eARC 播放另行验收。
@@ -101,3 +114,5 @@ Windows 累积更新或 Dolby Access 商店更新改变这些文件后，MAT 不
 独立 Sonic HRTF 入口、tap 及其专用测试另外保存在
 [codex/mat-sonic-archive-20261023](https://github.com/AlkaidLab/foundation-sunshine/tree/codex/mat-sonic-archive-20261023)
 （`d006e4b`）。当前仅构建 plugin 捕获入口，保留共用对象桥、原生 worker 和回归。
+
+</details>

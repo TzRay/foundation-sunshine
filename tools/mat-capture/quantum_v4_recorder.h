@@ -33,7 +33,7 @@ namespace q4 {
     bool
     healthy();
     void
-    fail();
+    fail(LONG reason = InvalidRecord, LONG arg1 = 0, LONG arg2 = 0, LONG arg3 = 0);
     bool
     begin(uint64_t renderer, uint64_t encoder, uint64_t implementation, uint32_t frames, Pass &pass);
     bool

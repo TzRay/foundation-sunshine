@@ -2,10 +2,10 @@
 // Shared native object -> dedicated MAT worker -> private live pipe.
 // No recorded input, source synthesis, default endpoint change or elevation.
 #define NOMINMAX
-#include "bridge.h"
-#include "native_queue.h"
 #include "../../src/spatial_audio/stream_ring_source.h"
 #include "../mat-live/publisher.h"
+#include "bridge.h"
+#include "native_queue.h"
 #include <memory>
 static uintptr_t
 LoadReviewed(HANDLE engine, DWORD pid, const fs::path &path, const std::string &hash, bool reattach) {
@@ -56,6 +56,7 @@ class NativeSession {
   Shared &pipe_;
   uint64_t domain_, epoch_;
   const char *sourceKind_;
+  bool *workerStopped_;
   bool finished_ = false, reported_ = false;
   void
   report() {
@@ -70,6 +71,8 @@ class NativeSession {
       spatial_audio::StreamRingSource source(*output_, epoch_, domain_);
       require(source.start(), "Native MAT output contract");
       auto progress = GetTickCount64();
+      auto last_report = progress;
+      size_t queue_peak = 0;
       spatial_audio::Frame frame;
       for (;;) {
         auto status = source.read(frame);
@@ -91,23 +94,45 @@ class NativeSession {
         require(qpc > 0, "Native MAT completion clock");
         progress = GetTickCount64();
         std::lock_guard lock(pipe_.mutex);
-        bool first = !pipe_.ready;
-        pipe_.ready = true;
+        const bool current_source = source.phase() == 2 && (std::string_view(sourceKind_) != "loopback-bed" || Qpc() - qpc < receiver::hz() / 10);
+        bool first = !pipe_.ready && current_source;
+        pipe_.ready = pipe_.ready || current_source;
         pipe_.encoder = domain_;
         pipe_.last_cycle = progress;
         ++pipe_.cycles;
-        if (first) printf("NATIVE_MAT_READY source=%s carrierBytes=61440 inputRenderer=0x%llx fileInput=0\n", sourceKind_, domain_);
-        if (pipe_.playing && qpc >= pipe_.play_qpc) {
+        if (first) {
+          printf("NATIVE_MAT_READY source=%s carrierBytes=61440 inputRenderer=0x%llx fileInput=0\n", sourceKind_, domain_);
+          printf("CARRIER_FORMAT pc=0x%04x pd=%u carrierRate=192000 carrierChannels=8\n",
+            unsigned(frame.bytes[4]) | unsigned(frame.bytes[5]) << 8, unsigned(frame.bytes[6]) | unsigned(frame.bytes[7]) << 8);
+          // Preserve wire byte order for comparison with the client. A native
+          // payload signature is diagnostic evidence, not an Atmos assertion.
+          printf("CARRIER_PAYLOAD wirePrefix=");
+          for (size_t i = 8; i < 20; ++i) printf("%02x", unsigned(frame.bytes[i]));
+          puts(" matVersionVerified=0 atmosMetadataVerified=0");
+        }
+        if (pipe_.playing && source.phase() != 1 && qpc >= pipe_.play_qpc) {
           require(pipe_.queue.size() < 4, "Live consumer overflow; no drop/replay");
           Cycle cycle {};
           memcpy(cycle.bytes.data(), frame.bytes.data(), frame.bytes.size());
           cycle.qpc = qpc;
           pipe_.queue.push_back(std::move(cycle));
+          queue_peak = std::max(queue_peak, pipe_.queue.size());
+          if (progress - last_report >= 5000) {
+            printf("NATIVE_DELIVERY cycles=%llu queue=%zu peakQueue=%zu captureAgeMs=%lld\n", pipe_.cycles, pipe_.queue.size(), queue_peak,
+              (int64_t(Qpc()) - int64_t(qpc)) * 1000 / receiver::hz());
+            last_report = progress;
+          }
           pipe_.changed.notify_all();
+        }
+        else if (!pipe_.playing) {
+          last_report = progress;
+          queue_peak = 0;
         }
       }
     }
     catch (const std::exception &e) {
+      printf("NATIVE_OUTPUT_FAILED %s inputFault=%ld outputError=%ld\n", e.what(), input_ ? receiver::get(input_->common.fault) : 0,
+        output_ ? receiver::get(output_->error) : 0);
       Broken(pipe_, e.what());
       if (input_) receiver::fail(*input_, receiver::codec);
       if (cancel_) SetEvent(cancel_);
@@ -119,6 +144,7 @@ class NativeSession {
     if (cancel_ && !finished_) SetEvent(cancel_);
     if (consumer_.joinable()) consumer_.join();
     bool done = !thread_ || WaitForSingleObject(thread_, 10000) == WAIT_OBJECT_0;
+    if (workerStopped_) *workerStopped_ = done;
     if (done)
       report();
     else
@@ -137,7 +163,8 @@ class NativeSession {
   }
 
 public:
-  NativeSession(HANDLE engine, const fs::path &codec, uintptr_t loaded, const std::wstring &vendorDirectory, uint64_t domain, uint64_t epoch, Shared &pipe, const char *sourceKind): engine_(engine), pipe_(pipe), domain_(domain), epoch_(epoch), sourceKind_(sourceKind) {
+  NativeSession(HANDLE engine, const fs::path &codec, uintptr_t loaded, const std::wstring &vendorDirectory, uint64_t domain, uint64_t epoch, Shared &pipe, const char *sourceKind, bool *workerStopped = nullptr):
+      engine_(engine), pipe_(pipe), domain_(domain), epoch_(epoch), sourceKind_(sourceKind), workerStopped_(workerStopped) {
     try {
       input_map_ = Map(sizeof(receiver::Shared));
       output_map_ = Map(sizeof(spatial_stream::Output));
@@ -152,9 +179,11 @@ public:
       require(data_ && cancel_, "Native queue events");
       auto dup = [&](HANDLE h, DWORD access = 0) {auto copy=DuplicateTo(engine_,h,access);remote_.push_back(copy);return copy; };
       spatial_stream::Args args { sizeof(args), spatial_stream::streamVersion, dup(input_map_), dup(data_), dup(cancel_), dup(GetCurrentProcess(), SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION), dup(output_map_), domain, epoch, { nonce[0], nonce[1] }, native_mat_guard::created(GetCurrentProcess()), GetCurrentProcessId(), 0, 0, 0 };
+      args.sourceDriven = std::string_view(sourceKind) == "loopback-bed";
       require(vendorDirectory.size() < std::size(args.vendorDirectory), "Dolby Access directory length");
       wmemcpy(args.vendorDirectory, vendorDirectory.c_str(), vendorDirectory.size() + 1);
       arguments_ = RemoteCopy(engine_, &args, sizeof(args));
+      if (workerStopped_) *workerStopped_ = false;
       thread_ = RemoteThread(engine_, Export(codec, loaded, "StartMatStreamReceiver"), arguments_);
       consumer_ = std::thread([this] { consume(); });
     }
@@ -184,5 +213,10 @@ public:
     report();
     require(s.status == 2 && !s.error && s.workerFinished && !s.workerTimedOut && s.eofSeen && s.vendorLoads == 1 && s.activations == 1 && s.initializations == 1 && s.hostGuardPassed && s.createHr == S_OK && s.mapperHr == S_OK && s.initializeHr == S_OK && s.submitHr == S_OK && s.processHr == S_OK, "Native MAT worker result");
     finished_ = true;
+  }
+  const spatial_stream::Stats &
+  finished_stats() const {
+    require(finished_, "Native MAT statistics require a completed session");
+    return output_->header;
   }
 };

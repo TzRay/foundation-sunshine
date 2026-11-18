@@ -71,6 +71,8 @@ namespace rtsp_stream {
                     crypto::aes_t iv,
                     clock_t::time_point now = clock_t::now());
 
+    bool claimed(const std::shared_ptr<launch_session_t> &session) const;
+
     bool
     activate(std::uint32_t launch_session_id);
 

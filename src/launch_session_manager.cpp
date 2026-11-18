@@ -201,6 +201,14 @@ namespace rtsp_stream {
   }
 
   bool
+  launch_session_manager_t::claimed(const std::shared_ptr<launch_session_t> &session) const {
+    std::lock_guard lock { _impl->mutex };
+    return std::any_of(_impl->tickets.begin(), _impl->tickets.end(), [&](const auto &ticket) {
+      return ticket.session == session && ticket.state == launch_ticket_state_e::claimed;
+    });
+  }
+
+  bool
   launch_session_manager_t::activate(std::uint32_t launch_session_id) {
     return erase(launch_session_id);
   }

@@ -5,7 +5,7 @@ namespace sonic_live {
   initialize_native_queue(receiver::Shared &input, spatial_stream::Output &output, uint64_t domain, uint64_t epoch, const uint64_t nonce[2]) {
     memset(&input, 0, sizeof(input));
     memset(&output, 0, sizeof(output));
-    input.contract = { receiver::magic, 1, 320, sizeof(input), sizeof(receiver::Slot), 32, 124968, sizeof(receiver::Call), domain, epoch, { nonce[0], nonce[1] }, GetCurrentProcessId(), 48000, 480, 0, receiver::hz() };
+    input.contract = { receiver::magic, receiver::version, 320, sizeof(input), sizeof(receiver::Slot), 32, 124968, sizeof(receiver::Call), domain, epoch, { nonce[0], nonce[1] }, GetCurrentProcessId(), 48000, 480, 0, receiver::hz() };
     receiver::put(input.writer.heartbeat, receiver::qpc());
     output.magic = spatial_stream::streamMagic;
     output.version = spatial_stream::streamVersion;

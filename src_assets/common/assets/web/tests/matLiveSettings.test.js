@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { useConfig } from '../composables/useConfig.js'
-import { useMatLiveStatus } from '../composables/useMatLiveStatus.js'
+import { matLiveFailureStage, useMatLiveStatus } from '../composables/useMatLiveStatus.js'
 import { resetBootstrapDataCache } from '../config/bootstrapData.js'
 
 test('MAT persists one switch and normalizes saved checkbox values', async (t) => {
@@ -22,8 +22,11 @@ test('MAT persists one switch and normalizes saved checkbox values', async (t) =
   state.initTabs()
   await state.loadConfig()
   assert.equal(state.config.value.mat_live, 'enabled')
+  assert.equal(state.config.value.mat_source, 'objects')
+  state.config.value.mat_source = 'bed'
   assert.equal(await state.save(), true)
   assert.equal(posted[0].mat_live, 'enabled')
+  assert.equal(posted[0].mat_source, 'bed')
   assert.equal('mat_live_pipe' in posted[0], false)
   assert.equal('mat_live_producer' in posted[0], false)
   state.config.value.mat_live = 'disabled'
@@ -99,4 +102,25 @@ test('a status request timeout clears the previous connected state', async (t) =
   await pending
   assert.equal(state.status.value.state, 'unavailable')
   assert.equal(state.loading.value, false)
+})
+
+test('streaming details retain the confirmed endpoint and the first delivery failure', async (t) => {
+  const response = {
+    state: 'streaming', source: 'native', negotiated_codec: 'mat-live-v1',
+    endpoint: '{confirmed-endpoint}', endpoint_confirmed: true,
+    first_error: 'Source bytes stopped', first_error_stage: 'pipe_payload',
+    last_error: 'Live MAT stopped', first_error_time_ms: 1234, error_count: 2,
+    timings: { pipe_read: { samples: 250, max_us: 25000 } },
+  }
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify(response), { status: 200 }))
+  const state = useMatLiveStatus()
+  await state.refresh()
+  assert.deepEqual(state.status.value, response)
+  assert.equal(matLiveFailureStage(state.status.value), 'source_delivery')
+  assert.equal(matLiveFailureStage({ first_error_stage: 'credit' }), 'send_queue')
+  assert.equal(matLiveFailureStage({ first_error_stage: 'pacing' }), 'send_schedule')
+  assert.equal(matLiveFailureStage({ first_error_stage: 'send-queue' }), 'send_queue')
+  assert.equal(matLiveFailureStage({ first_error_stage: 'pipe_restart' }), 'audio_recovery')
+  assert.equal(matLiveFailureStage({ first_error_stage: 'unexpected-new-stage' }), 'unknown')
+  state.dispose()
 })

@@ -4,7 +4,7 @@
 
 namespace spatial_stream {
   using namespace receiver;
-  constexpr uint32_t streamMagic = 0x32534f4d, streamVersion = 3, slots = 8, payloadCapacity = 12 + 64 * 1940;
+  constexpr uint32_t streamMagic = 0x32534f4d, streamVersion = 5, slots = 8, payloadCapacity = 12 + 64 * 1944;
   constexpr uint32_t nativeFormat = 1, fakeFormat = 0x80000001u;
   struct Stats {
     uint32_t magic, version, bytes, kind;
@@ -25,7 +25,7 @@ namespace spatial_stream {
     uint64_t sequence, epoch, domain, sampleStart;
     int64_t completedQpc;
     uint32_t sourceIndex, frames;
-    uint64_t reserved;
+    int64_t captureQpc;
     uint32_t checksum, reserved2;
   };
 #pragma pack(pop)
@@ -48,7 +48,7 @@ namespace spatial_stream {
     HANDLE input, data, cancel, owner, output;
     uint64_t domain, epoch, nonce[2], ownerCreationTime;
     // Zero leaves duration/round count unbounded; liveness and native pacing stay on.
-    uint32_t ownerPid, maxSourceRounds, maxSeconds, reserved;
+    uint32_t ownerPid, maxSourceRounds, maxSeconds, sourceDriven;
     // Native only: the publisher resolves the installed Dolby Access package;
     // the worker re-checks its shape and pinned DLL hashes before loading.
     wchar_t vendorDirectory[260];
@@ -61,7 +61,7 @@ namespace spatial_stream {
   using Start = DWORD(WINAPI *)(const Args *);
   using FakeStart = DWORD(WINAPI *)(const Args *, const FakeConfig *);
   inline bool
-  argsValid(const Args &a) { return a.bytes == sizeof(a) && a.version == streamVersion && a.input && a.data && a.cancel && a.owner && a.output && a.domain && a.epoch && a.ownerPid && a.ownerCreationTime && !a.reserved && wmemchr(a.vendorDirectory, L'\0', 260) != nullptr; }
+  argsValid(const Args &a) { return a.bytes == sizeof(a) && a.version == streamVersion && a.input && a.data && a.cancel && a.owner && a.output && a.domain && a.epoch && a.ownerPid && a.ownerCreationTime && a.sourceDriven <= 1 && wmemchr(a.vendorDirectory, L'\0', 260) != nullptr; }
   inline bool
   contract(const Shared &s, const Args &a) {
     const auto &c = s.contract;
@@ -95,7 +95,7 @@ namespace spatial_stream {
     h.epoch = o.epoch;
     h.domain = o.domain;
     h.format = o.format;
-    h.reserved = h.reserved2 = 0;
+    h.reserved2 = 0;
     h.checksum = blockChecksum(h, p);
     auto &slot = o.slots[w % slots];
     slot.header = h;
@@ -122,7 +122,7 @@ namespace spatial_stream {
     if (r == w) return get(o.completed) ? Poll::ended : Poll::pending;
     auto &s = o.slots[r % slots];
     auto h = s.header;
-    if (h.magic != streamMagic || h.bytes > payloadCapacity || h.format != o.format || h.epoch != o.epoch || h.domain != o.domain || h.sequence != expected || h.frames != 480 || h.phase < 1 || h.phase > 3 || h.reserved || h.reserved2 || blockChecksum(h, s.payload) != h.checksum) {
+    if (h.magic != streamMagic || h.bytes > payloadCapacity || h.format != o.format || h.epoch != o.epoch || h.domain != o.domain || h.sequence != expected || h.frames != 480 || h.phase < 1 || h.phase > 3 || h.captureQpc < 0 || h.reserved2 || blockChecksum(h, s.payload) != h.checksum) {
       InterlockedCompareExchange(&o.error, badFrame, 0);
       return Poll::failed;
     }

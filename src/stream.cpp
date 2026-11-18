@@ -4,6 +4,9 @@
  */
 #include "process.h"
 #include "spatial_transport/mat_live_session.h"
+#include "spatial_audio/mat_pipe_recovery.h"
+#include "spatial_transport/mat_send_progress.h"
+#include "spatial_transport/mat_audio_recovery.h"
 
 #include <algorithm>
 #include <bit>
@@ -74,6 +77,9 @@ extern "C" {
 #include "clipboard_bridge.h"
 #include "cursor_channel.h"
 #include "platform/common.h"
+#ifdef _WIN32
+  #include "platform/windows/mmcss_audio.h"
+#endif
 #include "touch_keyboard_session.h"
 #include "text_context/bridge.h"
 
@@ -181,6 +187,18 @@ namespace stream {
       return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+    }
+
+    std::int64_t
+    steady_now_us() {
+      return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void
+    mat_max(std::atomic<uint64_t> &value, uint64_t sample) {
+      auto previous = value.load(std::memory_order_relaxed);
+      while (sample > previous && !value.compare_exchange_weak(previous, sample, std::memory_order_relaxed)) {}
     }
 
     std::int64_t
@@ -652,8 +670,14 @@ namespace stream {
       util::buffer_t<uint8_t *> shards_p;
 
       audio_fec_packet_t fec_packet;
-      std::atomic<uint64_t> mat_sent { 0 };
+      spatial_transport::MatSendProgress mat_progress;
+      spatial_transport::MatAudioRecovery recovery;
+      std::atomic<uint64_t> mat_dequeued { 0 };
+      std::atomic<int64_t> mat_send_started_ms { 0 }, mat_send_completed_ms { 0 };
       std::atomic_bool mat_send_failed { false };
+      std::array<std::atomic<int64_t>, 4> mat_enqueued_us {};
+      std::atomic<uint64_t> mat_queue_max_us { 0 }, mat_send_max_us { 0 }, mat_send_calls { 0 };
+      std::atomic<uint64_t> mat_send_over_10ms { 0 }, mat_send_over_60ms { 0 };
       std::unique_ptr<platf::deinit_t> qos;
 
       bool enable_mic;
@@ -1966,6 +1990,17 @@ namespace stream {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
     });
 
+    server->map(MAT_RECOVERY_PACKET_TYPE, [](session_t *session, const std::string_view &payload) {
+      if (!session->config.audio.mat_live_recovery || session->config.controlProtocolType != 13) return;
+      MAT_AUDIO_RECOVERY message {};
+      if (!MatRecoveryDecode(reinterpret_cast<const uint8_t *>(payload.data()), payload.size(), &message) ||
+          !session->audio.recovery.receive(message))
+        BOOST_LOG(warning) << "Rejected MAT audio recovery control session=" << session->launch_session_id;
+      else if (message.verb == MAT_RECOVERY_PLAYING)
+        BOOST_LOG(info) << "MAT audio playback progress confirmed session=" << session->launch_session_id
+                        << " generation=" << message.generation;
+    });
+
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_START_A]"sv;
     });
@@ -2502,6 +2537,15 @@ namespace stream {
             has_session_awaiting_peer = true;
           }
           else {
+            if (session->config.audio.mat_live_recovery) {
+              if (auto recovery = session->audio.recovery.take_outbound()) {
+                uint8_t wire[MAT_RECOVERY_V2_BYTES];
+                MatRecoveryEncode(wire, &*recovery);
+                if (send_control_payload(session, MAT_RECOVERY_PACKET_TYPE,
+                    std::string_view(reinterpret_cast<const char *>(wire), MatRecoverySize(&*recovery)), "MAT audio recovery") < 0)
+                  session::stop(*session, session::stop_reason_e::audio_ended);
+              }
+            }
             if (session->config.mlFeatureFlags & ML_FF_HOST_SESSION_STATE) {
               // Polled lazily so hosts without opted-in clients never query WTS.
               if (now >= next_host_session_poll) {
@@ -3927,6 +3971,11 @@ namespace stream {
 
     // Audio traffic is sent on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
+#ifdef _WIN32
+    // Register once when this shared sender first serves MAT; keep the task
+    // until the sender exits so interleaved sessions do not churn MMCSS handles.
+    std::optional<platf::mmcss_audio_t> mat_send_priority;
+#endif
 
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
@@ -3935,6 +3984,13 @@ namespace stream {
 
       TUPLE_2D_REF(channel_data, packet_data, *packet);
       auto session = (session_t *) channel_data;
+      if (session->config.audio.codec == audio::CODEC_MAT_LIVE && session->audio.recovery.suspended.load()) {
+        // Only this session's old generation is discarded. Complete its credit
+        // before the audio owner resets FEC/peer state; other sessions keep sending.
+        session->audio.mat_dequeued.fetch_add(1, std::memory_order_relaxed);
+        session->audio.mat_progress.finish(true);
+        continue;
+      }
       session->last_audio_activity_ms.store(steady_now_ms(), std::memory_order_relaxed);
 
       auto sequenceNumber = session->audio.sequenceNumber;
@@ -3946,6 +4002,26 @@ namespace stream {
 
       // 检查客户端是否启用了音频加密
       const bool live_mat = session->config.audio.codec == audio::CODEC_MAT_LIVE;
+#ifdef _WIN32
+      if (live_mat && !mat_send_priority) {
+        mat_send_priority.emplace();
+        BOOST_LOG(info) << "MAT sender MMCSS Pro Audio: active=" << mat_send_priority->active()
+                        << " error=" << mat_send_priority->error();
+      }
+#endif
+      if (live_mat) {
+        const auto dequeued = session->audio.mat_dequeued.fetch_add(1, std::memory_order_relaxed);
+        const auto queued_at = session->audio.mat_enqueued_us[dequeued % 4].load(std::memory_order_acquire);
+        mat_max(session->audio.mat_queue_max_us, uint64_t((std::max)(int64_t(0), steady_now_us() - queued_at)));
+      }
+      const auto record_mat_send = [&](int64_t began) {
+        if (!live_mat) return;
+        const auto duration = uint64_t((std::max)(int64_t(0), steady_now_us() - began));
+        mat_max(session->audio.mat_send_max_us, duration);
+        session->audio.mat_send_calls.fetch_add(1, std::memory_order_relaxed);
+        if (duration >= 10000) session->audio.mat_send_over_10ms.fetch_add(1, std::memory_order_relaxed);
+        if (duration >= 60000) session->audio.mat_send_over_60ms.fetch_add(1, std::memory_order_relaxed);
+      };
       bool audio_encryption_enabled = !live_mat && (session->config.encryptionFlagsEnabled & SS_ENC_AUDIO) != 0;
       if (sequenceNumber == 0 && !live_mat) {
         // 只在第一个包时记录一次，避免日志过多
@@ -3991,6 +4067,10 @@ namespace stream {
 
       audio_packet.rtp.sequenceNumber = util::endian::big(sequenceNumber);
       audio_packet.rtp.timestamp = util::endian::big(timestamp);
+      // This packet header is shared across sessions. Never inherit another
+      // session's SSRC, including when switching back to legacy audio.
+      audio_packet.rtp.ssrc = util::endian::big(session->config.audio.mat_live_recovery == 2 ?
+        session->config.audio.mat_live->ssrc : uint32_t(0));
 
       session->audio.sequenceNumber++;
       session->audio.timestamp += session->config.audio.packetDuration;
@@ -4007,7 +4087,11 @@ namespace stream {
           session->audio.peer.port(),
           session->localAddress,
         };
+        if (live_mat) session->audio.mat_send_started_ms.store(steady_now_ms(), std::memory_order_relaxed);
+        const auto send_began = live_mat ? steady_now_us() : 0;
         const bool audio_sent = platf::send(send_info);
+        record_mat_send(send_began);
+        if (live_mat) session->audio.mat_send_completed_ms.store(steady_now_ms(), std::memory_order_relaxed);
         if (!audio_sent) {
           perf::record_audio_send_failure(session->launch_session_id, false);
           if (audio::is_mat_codec(session->config.audio.codec)) session->audio.mat_send_failed.store(true);
@@ -4038,7 +4122,11 @@ namespace stream {
               session->audio.peer.port(),
               session->localAddress,
             };
+            if (live_mat) session->audio.mat_send_started_ms.store(steady_now_ms(), std::memory_order_relaxed);
+            const auto parity_began = live_mat ? steady_now_us() : 0;
             const bool parity_sent = platf::send(send_info);
+            record_mat_send(parity_began);
+            if (live_mat) session->audio.mat_send_completed_ms.store(steady_now_ms(), std::memory_order_relaxed);
             if (!parity_sent) {
               perf::record_audio_send_failure(session->launch_session_id, true);
               if (audio::is_mat_codec(session->config.audio.codec)) session->audio.mat_send_failed.store(true);
@@ -4050,9 +4138,12 @@ namespace stream {
       catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast audio failed "sv << e.what();
         if (audio::is_mat_codec(session->config.audio.codec)) session->audio.mat_send_failed.store(true);
-        std::this_thread::sleep_for(100ms);
+        if (!live_mat) std::this_thread::sleep_for(100ms);
       }
-      if (audio::is_mat_codec(session->config.audio.codec)) session->audio.mat_sent.fetch_add(1, std::memory_order_release);
+      if (live_mat) {
+        const auto completed = session->audio.mat_progress.completed.load(std::memory_order_relaxed) + 1;
+        session->audio.mat_progress.finish(completed % 4 == 0 || session->audio.mat_send_failed.load());
+      }
     }
 
     shutdown_event->raise(true);
@@ -4194,12 +4285,15 @@ namespace stream {
     auto start_time = std::chrono::steady_clock::now();
     auto current_time = start_time;
 
-    while (current_time - start_time < config::stream.ping_timeout) {
+    auto shutdown = session->mail->event<bool>(mail::shutdown);
+    auto global_shutdown = mail::man->event<bool>(mail::shutdown);
+    while (current_time - start_time < timeout && !shutdown->peek() && !global_shutdown->peek()) {
       auto delta_time = current_time - start_time;
 
-      auto msg_opt = messages->pop(config::stream.ping_timeout - delta_time);
+      auto msg_opt = messages->pop(std::min(timeout - std::chrono::duration_cast<std::chrono::milliseconds>(delta_time), 20ms));
       if (!msg_opt) {
-        break;
+        current_time = std::chrono::steady_clock::now();
+        continue;
       }
 
       TUPLE_2D_REF(recv_peer, msg, *msg_opt);
@@ -4257,6 +4351,129 @@ namespace stream {
   }
 
   void
+  reset_mat_sender(session_t *session, uint64_t &submitted) {
+    // The old generation's submitted credit has been fully returned. No
+    // sender can still reference its peer, sequence or FEC shard contents.
+    session->audio.sequenceNumber = 0;
+    session->audio.timestamp = 0;
+    std::fill(session->audio.shards.begin(), session->audio.shards.end(), 0);
+    session->audio.fec_packet.rtp.timestamp = 0;
+    session->audio.fec_packet.rtp.ssrc = session->audio.fec_packet.fecHeader.ssrc =
+      util::endian::big(session->config.audio.mat_live_recovery == 2 ? session->config.audio.mat_live->ssrc : uint32_t(0));
+    session->audio.mat_progress.reset_after_drain(submitted);
+    session->audio.mat_dequeued.store(0);
+    session->audio.mat_send_failed.store(false);
+    session->audio.mat_send_calls.store(0);
+    session->audio.mat_send_max_us.store(0);
+    session->audio.mat_queue_max_us.store(0);
+    session->audio.mat_send_over_10ms.store(0);
+    session->audio.mat_send_over_60ms.store(0);
+  }
+
+  bool
+  recover_mat_audio(session_t *session, decltype(broadcast_shared)::ptr_t ref,
+                    uint64_t &submitted, const std::function<bool()> &cancelled) {
+    if (!session->config.audio.mat_live_recovery || cancelled()) return false;
+#if defined(_WIN32)
+    auto &old = session->config.audio.mat_live;
+    auto *pipe = dynamic_cast<spatial_audio::NativeMatPipeSource *>(old->source.get());
+    if (!pipe || !pipe->supports_restart()) {
+      session->audio.recovery.fail(MAT_RECOVERY_BLOCKED);
+      return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    MAT_AUDIO_RECOVERY prepare {};
+    prepare.verb = MAT_RECOVERY_PREPARE;
+    prepare.generation = 1;
+    prepare.previousEpoch = old->profile.epoch;
+    prepare.domain = old->profile.domain;
+    prepare.serverPort = ref->audio_sock.local_endpoint().port();
+    prepare.reason = 1;
+    do {
+      if (RAND_bytes(reinterpret_cast<uint8_t *>(&prepare.newEpoch), sizeof(prepare.newEpoch)) != 1) {
+        session->audio.recovery.fail(MAT_RECOVERY_BLOCKED); return false;
+      }
+      prepare.newEpoch = (prepare.newEpoch & INT64_MAX) | 1;
+    } while (prepare.newEpoch == prepare.previousEpoch);
+    if (RAND_bytes(prepare.token, sizeof(prepare.token)) != 1) {
+      session->audio.recovery.fail(MAT_RECOVERY_BLOCKED); return false;
+    }
+    // Keep the token binary (a leading zero is valid). Ensure it is not empty.
+    prepare.token[15] |= 1;
+    if (!session->audio.recovery.begin(prepare)) {
+      session->audio.recovery.fail(MAT_RECOVERY_BLOCKED);
+      return false;
+    }
+    session->audio.recovery.suspended.store(true);
+    BOOST_LOG(info) << "MAT audio recovery preparing session=" << session->launch_session_id
+                    << " generation=" << prepare.generation << " epoch=" << prepare.newEpoch;
+    uint32_t failure_reason = MAT_RECOVERY_RETRYABLE;
+    try {
+      try {
+        if (auto replacement = spatial_audio::recover_mat_pipe(*pipe, deadline, cancelled, [](auto until, const auto &stop) {
+              spatial_audio::request_mat_manager(until, stop);
+            })) {
+          old->source = std::move(replacement);
+          BOOST_LOG(info) << "MAT audio recovery acquired a new authenticated source lease";
+        }
+      } catch (const spatial_audio::MatSourceBlocked &) {
+        failure_reason = MAT_RECOVERY_BLOCKED;
+        throw;
+      }
+      if (!session->audio.mat_progress.wait(submitted, deadline, cancelled)) {
+        failure_reason = MAT_RECOVERY_BLOCKED;
+        throw std::runtime_error("MAT old sender did not drain; automatic audio rebuild blocked");
+      }
+      spatial_audio::require(session->audio.recovery.wait_ready(deadline, cancelled), "MAT recovery READY timeout/failure");
+      spatial_audio::require(session->audio.recovery.start(), "MAT recovery cancelled before START");
+      const std::string token(reinterpret_cast<const char *>(prepare.token), sizeof(prepare.token));
+      udp::endpoint peer(session->audio.peer.address(), 0);
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+      spatial_audio::require(remaining > 0ms && recv_ping(session, ref, socket_e::audio, token, peer, remaining) == 0,
+        "MAT recovery new UDP identity timeout");
+      spatial_audio::require(peer != session->audio.peer, "MAT recovery reused the old UDP peer");
+      spatial_audio::require(!cancelled(), "MAT recovery cancelled");
+      auto next = std::make_shared<spatial_transport::LiveSession>();
+      next->profile = old->profile;
+      next->profile.epoch = prepare.newEpoch;
+      next->recovery_supported = true;
+      next->recovery_selected = session->config.audio.mat_live_recovery;
+      next->ssrc = prepare.ssrc;
+      next->source_cancelled = cancelled;
+      next->reservation = std::move(old->reservation);
+      next->source = std::move(old->source);
+      // RTSP's original profile remains immutable in its launch record.
+      old->report = {};
+      old = std::move(next);
+      reset_mat_sender(session, submitted);
+      session->audio.peer = peer;
+      session->audio.ping_payload = token;
+      session->audio.qos.reset();
+      auto address = peer.address();
+      session->audio.qos = platf::enable_socket_qos(ref->audio_sock.native_handle(), address, peer.port(),
+        platf::qos_data_type_e::audio, session->config.audioQosType != 0);
+      spatial_audio::require(session->audio.recovery.resumed(), "MAT peer failed during recovery");
+      session->audio.recovery.suspended.store(false);
+      BOOST_LOG(info) << (session->config.audio.mat_live_recovery == 2 ? "MAT audio recovery started; awaiting playback session=" : "MAT audio recovery resumed session=") << session->launch_session_id
+                      << " generation=" << prepare.generation << " peer=" << peer << " epoch=" << prepare.newEpoch;
+      return true;
+    }
+    catch (const std::exception &e) {
+      session->audio.recovery.fail(failure_reason);
+      if (!cancelled()) {
+        spatial_audio::mat_live_status.failed(e.what(), "audio_recovery");
+        BOOST_LOG(error) << "MAT audio recovery failed: " << e.what();
+      }
+      return false;
+    }
+#else
+    (void) ref;
+    (void) submitted;
+    return false;
+#endif
+  }
+
+  void
   audioThread(session_t *session) {
     auto global_shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto fg = util::fail_guard([&]() {
@@ -4278,21 +4495,68 @@ namespace stream {
       session->audio.peer.port(), platf::qos_data_type_e::audio, session->config.audioQosType != 0);
 
     if (session->config.audio.codec == audio::CODEC_MAT_LIVE) {
+      // MAT bypasses audio::capture(), which normally raises the capture
+      // thread priority. Its pipe reads and 20 ms pacing have the same deadline.
+      platf::adjust_thread_priority(platf::thread_priority_e::critical);
+#ifdef _WIN32
+      platf::mmcss_audio_t audio_priority;
+      BOOST_LOG(info) << "MAT pacing MMCSS Pro Audio: active=" << audio_priority.active()
+                      << " error=" << audio_priority.error();
+#endif
       auto shutdown = session->mail->event<bool>(mail::shutdown);
       auto packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
       uint64_t submitted = 0;
-      const auto cancelled = [&] { return shutdown->peek() || global_shutdown_event->peek(); };
+      uint64_t credit_samples = 0, credit_max_us = 0, credit_over_10ms = 0, credit_over_60ms = 0;
+      const auto stopping = [&] { return shutdown->peek() || global_shutdown_event->peek(); };
+      const auto cancelled = [&] {
+        session->audio.recovery.poll();
+        return stopping() || session->audio.recovery.requested.load();
+      };
+      const auto report = [&](const spatial_transport::LiveDiagnostics &d) {
+        auto &status = spatial_audio::mat_live_status;
+        status.record_timing("pacing", d.samples, d.late_max_us, d.over_10ms, d.over_60ms);
+        status.record_timing("credit", credit_samples, credit_max_us, credit_over_10ms, credit_over_60ms);
+        const auto sends = session->audio.mat_send_calls.exchange(0);
+        const auto send_max = session->audio.mat_send_max_us.exchange(0);
+        const auto queue_max = session->audio.mat_queue_max_us.exchange(0);
+        status.record_timing("send", sends, send_max, session->audio.mat_send_over_10ms.exchange(0), session->audio.mat_send_over_60ms.exchange(0));
+        status.record_timing("send_queue", d.samples * 4, queue_max);
+        BOOST_LOG(info) << "MAT delivery session=" << session->launch_session_id << " cycles=" << d.cycles
+                        << " sourceReadMaxUs=" << d.read_max_us << " pacingLateMaxUs=" << d.late_max_us
+                        << " groupMaxUs=" << d.group_max_us << " creditMaxUs=" << credit_max_us
+                        << " sendMaxUs=" << send_max << " queueMaxUs=" << queue_max;
+        credit_samples = credit_max_us = credit_over_10ms = credit_over_60ms = 0;
+      };
+      for (;;) {
       try {
         spatial_audio::require(bool(session->config.audio.mat_live), "Missing native MAT source lease");
+        session->config.audio.mat_live->report = report;
+        // A recovery request stops between complete source records. Cancelling
+        // an in-flight pipe read for recovery would lose its record boundary.
+        session->config.audio.mat_live->source_cancelled = stopping;
         auto timer = platf::create_high_precision_timer();
         spatial_audio::require(timer && bool(*timer), "Live MAT pacing timer unavailable");
         // Keep at most one FEC data group outstanding. Waiting after every
         // fragment would make the scheduler round 333us pacing into 1ms ticks.
         const auto acknowledged = [&](uint64_t minimum) {
+          session->config.audio.mat_live->diagnostics.stage = "credit";
+          const auto began = std::chrono::steady_clock::now();
           const auto deadline = std::chrono::steady_clock::now() + 60ms;
-          while (session->audio.mat_sent.load(std::memory_order_acquire) < minimum) {
-            spatial_audio::require(!cancelled() && std::chrono::steady_clock::now() < deadline, "Live MAT broadcast deadline/cancel");
-            timer->sleep_for(50us);
+          const bool ready = session->audio.mat_progress.wait(minimum, deadline, cancelled);
+          const auto elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began).count());
+          ++credit_samples;
+          credit_max_us = (std::max)(credit_max_us, elapsed);
+          credit_over_10ms += elapsed >= 10000;
+          credit_over_60ms += elapsed >= 60000;
+          spatial_audio::require(!cancelled(), "Live MAT broadcast cancelled");
+          if (!ready) {
+              const auto now = steady_now_ms();
+              BOOST_LOG(::error) << "MAT broadcast timeout: required=" << minimum << " submitted=" << submitted
+                               << " dequeued=" << session->audio.mat_dequeued.load() << " sent=" << session->audio.mat_progress.completed.load()
+                               << " dequeueAgeMs=" << now - session->last_audio_activity_ms.load()
+                               << " sendStartAgeMs=" << now - session->audio.mat_send_started_ms.load()
+                               << " sendEndAgeMs=" << now - session->audio.mat_send_completed_ms.load();
+              throw std::runtime_error("Live MAT broadcast deadline");
           }
           spatial_audio::require(!session->audio.mat_send_failed.load(), "Live MAT UDP send failed");
         };
@@ -4301,6 +4565,8 @@ namespace stream {
           if (submitted >= 4) acknowledged(submitted - 3);
           audio::buffer_t packet(n);
           std::memcpy(packet.begin(), data, n);
+          session->config.audio.mat_live->diagnostics.stage = "send-queue";
+          session->audio.mat_enqueued_us[submitted % 4].store(steady_now_us(), std::memory_order_release);
           spatial_audio::require(packets->try_raise(session, std::move(packet)), "Live MAT send queue full/stopped");
           ++submitted;
         };
@@ -4310,12 +4576,47 @@ namespace stream {
         const auto cycles = spatial_transport::live_session(*session->config.audio.mat_live,
           session->audio.cipher.key.data(), session->audio.cipher.key.size(), emit, wait, cancelled);
         acknowledged(submitted);
+        report(session->config.audio.mat_live->diagnostics);
         BOOST_LOG(info) << "Native MAT capture ended cleanly: " << cycles << " cycles";
         shutdown->view();
+        break;
       }
       catch (const std::exception &e) {
-        if (!cancelled()) spatial_audio::mat_live_status.failed(e.what());
-        BOOST_LOG(::error) << "Live MAT stopped: " << e.what();
+        if (stopping()) {
+          BOOST_LOG(info) << "Live MAT session stopped normally";
+          break;
+        }
+        else {
+          const auto *live = session->config.audio.mat_live.get();
+          if (live) report(live->diagnostics);
+          spatial_audio::mat_live_status.failed(e.what(), live ? live->diagnostics.stage : "prepare");
+          BOOST_LOG(::error) << "Live MAT stopped: " << e.what();
+        }
+        bool recovered = false;
+        do {
+          if (session->config.audio.mat_live_recovery == 2) {
+            if (session->audio.recovery.blocked()) {
+              spatial_audio::mat_live_status.failed("MAT automatic audio recovery blocked; reconnect required", "audio_recovery_blocked");
+              if (session->config.audio.mat_live->source) session->config.audio.mat_live->source->stop();
+            }
+            // The audio owner stays alive during cooldown/blocked. Video and
+            // control have their own lifetimes; global cancellation still wins.
+            if (!session->audio.recovery.wait_retry(stopping)) break;
+          }
+          recovered = recover_mat_audio(session, ref, submitted, stopping);
+        } while (!recovered && !stopping() && session->config.audio.mat_live_recovery == 2);
+        if (recovered) {
+          credit_samples = credit_max_us = credit_over_10ms = credit_over_60ms = 0;
+          continue;
+        }
+        break;
+      }
+      }
+      if (session->config.audio.mat_live) {
+        session->config.audio.mat_live->report = {};
+        session->config.audio.mat_live->source_cancelled = {};
+        if (session->config.audio.mat_live->source) session->config.audio.mat_live->source->stop();
+        session->config.audio.mat_live->reservation.reset();
       }
       return;
     }
@@ -4781,6 +5082,8 @@ namespace stream {
       session->hdr_target_source = launch_session.hdr_target_source;
 
       session->config = config;
+      if (config.audio.mat_live_recovery && config.audio.mat_live)
+        session->audio.recovery.initialize(config.audio.mat_live->profile.epoch, config.audio.mat_live_recovery, config.audio.mat_live->ssrc);
       session->config.monitor.capture_target = std::make_shared<streaming::capture_target_t>();
 
       session->control.connect_data = launch_session.control_connect_data;
@@ -4830,10 +5133,10 @@ namespace stream {
       session->audio.fec_packet.rtp.header = 0x80;
       session->audio.fec_packet.rtp.packetType = 127;
       session->audio.fec_packet.rtp.timestamp = 0;
-      session->audio.fec_packet.rtp.ssrc = 0;
+      session->audio.fec_packet.rtp.ssrc = util::endian::big(config.audio.mat_live_recovery == 2 ? config.audio.mat_live->ssrc : uint32_t(0));
 
       session->audio.fec_packet.fecHeader.payloadType = 97;
-      session->audio.fec_packet.fecHeader.ssrc = 0;
+      session->audio.fec_packet.fecHeader.ssrc = session->audio.fec_packet.rtp.ssrc;
 
       session->audio.cipher = crypto::cipher::cbc_t {
         launch_session.gcm_key, true

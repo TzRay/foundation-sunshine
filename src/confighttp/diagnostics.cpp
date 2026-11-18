@@ -25,6 +25,7 @@
   #include "src/display_device/vdd_utils.h"
   #include "src/platform/windows/mic_write.h"
   #include "src/platform/windows/vulkan_hdr_bridge_session.h"
+  #include "src/spatial_audio/mat_auto_source.h"
 #endif
 
 using namespace std::literals;
@@ -410,7 +411,80 @@ namespace confighttp::diagnostics {
     getMatLiveStatus(resp_https_t response, req_https_t request) {
       if (!authenticate(response, request)) return;
       const auto snapshot = spatial_audio::mat_live_status.snapshot();
-      const char *state = snapshot.state();
+      std::string state = snapshot.state();
+      json output {
+        { "state", state }, { "last_error", snapshot.last_error },
+        { "source", snapshot.leases && !snapshot.source.empty() ? snapshot.source : config::audio.mat_source },
+        { "source_state", "unobserved" }, { "source_error", "" },
+        { "endpoint", snapshot.leases ? snapshot.endpoint : "" },
+        { "endpoint_confirmed", snapshot.leases && !snapshot.endpoint.empty() },
+        { "publisher_pid", snapshot.publisher_pid }, { "engine_pid", snapshot.engine_pid },
+        { "first_error", snapshot.first_error }, { "first_error_stage", snapshot.first_error_stage },
+        { "first_error_time_ms", snapshot.first_error_time_ms }, { "error_count", snapshot.error_count },
+        { "negotiated_codec", snapshot.running ? "mat-live-v1" : "" },
+        { "timings", json::object() },
+      };
+      for (const auto &[stage, timing] : snapshot.timings) {
+        output["timings"][stage] = {
+          { "samples", timing.samples }, { "max_us", timing.max_us }, { "over_10ms", timing.over_10ms },
+          { "over_60ms", timing.over_60ms }, { "updated_ms", timing.updated_ms },
+        };
+      }
+#ifdef _WIN32
+      // A fresh supervisor heartbeat is independent of an RTSP lease. Reading
+      // it must never reserve the single capture pipe or disturb a stream.
+      if (snapshot.leases || config::audio.mat_source == "bed" || config::audio.mat_source == "native") {
+        PWSTR directory = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr, &directory))) {
+          const auto path = std::filesystem::path(directory) / L"Sunshine" / L"MAT" / L"manager.json";
+          CoTaskMemFree(directory);
+          try {
+            // Allow the writer to atomically replace its heartbeat while a
+            // status request holds this file open.
+            HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("MAT manager status unavailable");
+            std::string content(16384, '\0');
+            DWORD bytes = 0;
+            const bool read = ReadFile(file, content.data(), DWORD(content.size()), &bytes, nullptr);
+            CloseHandle(file);
+            if (!read || bytes == content.size()) throw std::runtime_error("MAT manager status unreadable");
+            content.resize(bytes);
+            const auto manager = json::parse(content);
+            const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            const auto updated = manager.at("updated_ms").get<int64_t>();
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, manager.at("manager_pid").get<DWORD>());
+            const bool alive = process && WaitForSingleObject(process, 0) == WAIT_TIMEOUT &&
+                               native_mat_guard::created(process) == manager.at("manager_created").get<uint64_t>() &&
+                               spatial_audio::trusted_mat_auto_publisher(process);
+            if (process) CloseHandle(process);
+            const auto source = manager.value("source", "bed");
+            const bool fresh = alive && updated <= now && now - updated < 5000;
+            const bool matched = fresh && (snapshot.leases ?
+              spatial_audio::mat_live_status.identify_source(
+                manager.at("publisher_pid").get<uint32_t>(), manager.at("publisher_created").get<uint64_t>(),
+                manager.at("engine_pid").get<uint32_t>(), manager.at("engine_created").get<uint64_t>(),
+                source, manager.at("endpoint").get<std::string>(), snapshot.lease_generation) : source == config::audio.mat_source);
+            if (matched) {
+              output["source"] = source;
+              output["source_state"] = manager.at("state");
+              output["source_error"] = manager.at("last_error");
+              output["endpoint"] = manager.at("endpoint");
+              output["endpoint_confirmed"] = true;
+              output["publisher_pid"] = manager.at("publisher_pid");
+              output["engine_pid"] = manager.at("engine_pid");
+              // The publisher can remain ready after a failed stream. Keep
+              // that readiness separate from the first host delivery failure.
+              if (snapshot.last_error.empty()) output["last_error"] = manager.at("last_error");
+              if (!snapshot.leases) state = manager.at("state").get<std::string>();
+            }
+            else if (!snapshot.leases) state = "stopped";
+          }
+          catch (const std::exception &) {
+            if (!snapshot.leases) state = "unobserved";
+          }
+        }
+      }
+#endif
       if (!config::audio.mat_live) {
         state = "disabled";
       }
@@ -420,11 +494,7 @@ namespace confighttp::diagnostics {
 #ifndef _WIN32
       state = "unsupported";
 #endif
-      // Only observations from real session activity; never open/probe the capture pipe here.
-      const json output {
-        { "state", state },
-        { "last_error", snapshot.last_error },
-      };
+      output["state"] = state;
       const web::CaseInsensitiveMultimap headers {
         { "Content-Type", "application/json" },
         { "Cache-Control", "no-store" },

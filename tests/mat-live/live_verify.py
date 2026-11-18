@@ -119,6 +119,7 @@ def main():
     preflight_checks = p.add_mutually_exclusive_group()
     preflight_checks.add_argument("--ui-preflight", action="store_true")
     preflight_checks.add_argument("--ticket-preflight", action="store_true")
+    preflight_checks.add_argument("--managed-bed-preflight", action="store_true")
     p.add_argument("--publisher", type=Path)
     p.add_argument("--tap", type=Path)
     p.add_argument("--tap-sha")
@@ -137,15 +138,17 @@ def main():
     android = all((args.adb, args.android_serial, args.android_apk))
     if any((args.adb, args.android_serial, args.android_apk)) and not android:
         p.error("Android needs explicit ADB, emulator serial and diagnostic APK")
-    if not android and not args.client_build:
+    if not android and not args.client_build and not args.preflight_only:
         p.error("Explicit client build or Android diagnostic APK required")
     if args.android_session_only and (not android or args.preflight_only):
         p.error("Android software session requires Android arguments, without --preflight-only")
-    client_binary = args.android_apk if android else args.client_build / "mat-live-session-client.exe"
+    client_binary = args.android_apk if android else args.client_build / "mat-live-session-client.exe" if args.client_build else None
     if args.ui_preflight and not args.preflight_only:
         p.error("UI preflight needs --preflight-only")
     if args.ticket_preflight and not args.preflight_only:
         p.error("Ticket preflight needs --preflight-only")
+    if args.managed_bed_preflight and (not args.preflight_only or not args.endpoint_id or not args.probe):
+        p.error("Managed bed preflight needs --preflight-only, --endpoint-id and --probe")
     if bool(args.operator_build) != bool(args.powershell):
         p.error("Operator build and explicit PowerShell executable must be paired")
     if not 8 <= args.seconds <= 30:
@@ -191,6 +194,8 @@ def main():
         "file_apps": (out / "apps.json").as_posix(), "log_path": (out / "host.log").as_posix()}
     if args.ticket_preflight:
         config.update(ping_timeout=1000, min_log_level="debug", stream_audio="false")
+    if args.managed_bed_preflight:
+        config.update(mat_source="bed", audio_sink=args.endpoint_id)
     (out / "sunshine.conf").write_text("\n".join(f"{k} = {v}" for k, v in config.items()) + "\n", encoding="utf8")
     portable = out / "host"
     portable.mkdir()
@@ -268,13 +273,16 @@ def main():
         result["isolatedTlsPairing"] = True
         print("PREFLIGHT paired isolated Sunshine server ready", flush=True)
         if args.preflight_only:
+            if args.managed_bed_preflight:
+                from managed_bed_preflight import verify_managed_bed
+                result["managedBed"] = verify_managed_bed(opener, args.port, request, apps.findtext("App/ID"), args.endpoint_id, args.probe, out)
             if args.ticket_preflight:
                 from ticket_preflight import verify_ticket_expiry
                 launched = True  # Keep cancellation in the existing guarded cleanup.
                 result["ticketExpiry"] = verify_ticket_expiry(request, apps.findtext("App/ID"), out / "host.log")
             if args.ui_preflight:
                 from ui_preflight import verify_ui
-                result["uiStatus"] = verify_ui(opener, args.port, config, out / "sunshine.conf")
+                result["uiStatus"] = verify_ui(opener, args.port, config, out / "sunshine.conf", request, apps.findtext("App/ID"))
             result["passed"] = True
             return
         if android:
@@ -412,7 +420,7 @@ def main():
         result.update(hostExitCode=host.returncode if host else None,
             publisherExitCode=publisher.returncode if publisher else None, clientExitCode=client.returncode if client else None,
             sourceExitCode=source.returncode if source else None, cleanupErrors=cleanup_errors,
-            hostSha256=sha(portable / "sunshine.exe"), clientSha256=sha(client_binary))
+            hostSha256=sha(portable / "sunshine.exe"), clientSha256=sha(client_binary) if client_binary else None)
         if cleanup_errors or (host and host.returncode != 0):
             result["passed"] = False
         save(out / "result.json", result)

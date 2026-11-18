@@ -1,4 +1,5 @@
 #include "capture_options.h"
+#include "audio_session_options.h"
 #include <iostream>
 int
 main() {
@@ -33,6 +34,13 @@ main() {
       rejected = true;
     }
     if (!rejected) return 4;
+    wchar_t executable[] = L"publisher", operation[] = L"--list-audio-sessions", option[] = L"--capture-endpoint", endpoint[] = L"endpoint-id";
+    wchar_t *args[] = { executable, operation, option, endpoint };
+    if (!sonic_live::audio_sessions::capture_endpoint(2, args).empty() ||
+        sonic_live::audio_sessions::capture_endpoint(4, args) != endpoint) return 6;
+    rejected = false;
+    try { sonic_live::audio_sessions::capture_endpoint(3, args); } catch (...) { rejected = true; }
+    if (!rejected || sonic_live::audio_sessions::quote("a\"\\\n\x01中文") != "\"a\\\"\\\\\\u000a\\u0001中文\"") return 7;
     std::cout << "PASS explicit continuous/bounded capture options, malformed bounds fail closed; nativeCapture=0\n";
     return 0;
   }

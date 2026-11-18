@@ -31,8 +31,9 @@ namespace mat_capture {
         mat_get32(p + 64) != 48000 || mat_get32(p + 68) != MAT_WIRE_CYCLE) return false;
     d = { mat_get32(p + 16), mat_get32(p + 32), mat_get32(p + 36), mat_get64(p + 24), mat_get64(p + 40),
       mat_get64(p + 48), mat_get64(p + 56), mat_get64(p + 72) };
-    // Source 2 binds an observed object renderer feeding a dedicated native MAT
-    // worker via paired MainPluginRenderer pre-submit observations.
+    // Source 2 binds the verified publisher and audiodg producing native MAT:
+    // either the dedicated object/PCM-bed worker or endpoint-bound system output.
+    // The historical native_object_source name keeps wire value 2.
     return d.kind == native_object_source && d.publisher_pid && d.engine_pid && d.publisher_created && d.engine_created &&
            d.epoch && d.epoch <= INT64_MAX && d.encoder && d.qpc_hz && d.qpc_hz <= INT64_MAX;
   }

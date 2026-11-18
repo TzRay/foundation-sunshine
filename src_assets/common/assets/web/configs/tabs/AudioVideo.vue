@@ -18,6 +18,7 @@ const props = defineProps(['platform', 'config', 'resolutions', 'fps'])
 
 const { t } = useI18n()
 const config = ref(props.config)
+const matAutoEndpoint = computed(() => props.platform === 'windows' && config.value.mat_live === 'enabled')
 const currentSubTab = ref(window.location.hash === '#nvenc_vdd_force_vsync' ? 'virtual-display' : 'display-modes')
 const showDownloadConfirm = ref(false)
 const micTestRunning = ref(false)
@@ -146,14 +147,18 @@ onBeforeUnmount(() => {
     <!-- Audio Sink -->
     <div class="mb-3">
       <label for="audio_sink" class="form-label">{{ $t('config.audio_sink') }}</label>
+      <input v-if="matAutoEndpoint" id="audio_sink" type="text" class="form-control"
+        :value="$t('config.mat_audio_sink_auto')" disabled />
       <input
+        v-else
         type="text"
         class="form-control"
         id="audio_sink"
         :placeholder="$tp('config.audio_sink_placeholder', 'alsa_output.pci-0000_09_00.3.analog-stereo')"
         v-model="config.audio_sink"
       />
-      <div class="form-text">
+      <div v-if="matAutoEndpoint" class="form-text">{{ $t('config.mat_audio_sink_auto_desc') }}</div>
+      <div v-else class="form-text">
         {{ $tp('config.audio_sink_desc') }}<br />
         <PlatformLayout :platform="platform">
           <template #windows>

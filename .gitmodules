@@ -16,8 +16,7 @@
 	branch = stable
 [submodule "third-party/moonlight-common-c"]
 	path = third-party/moonlight-common-c
-	url = https://github.com/qiin2333/moonlight-common-c.git
-	branch = mic
+	url = https://github.com/TzRay/moonlight-common-c.git
 [submodule "third-party/nanors"]
 	path = third-party/nanors
 	url = https://github.com/sleepybishop/nanors.git

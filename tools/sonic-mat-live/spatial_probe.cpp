@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audiopolicy.h>
+#include <endpointvolume.h>
 #include <spatialaudioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <wrl/client.h>
@@ -12,6 +14,7 @@
 #include <vector>
 #include <stdexcept>
 #include "../../src/spatial_audio/object_input_protocol.h"
+#include "mat_endpoint.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -77,6 +80,7 @@ List(const std::vector<ComPtr<IMMDevice>> &devices) {
     printf("[%zu] %s\n", i, Utf8(name.vt == VT_LPWSTR ? name.pwszVal : L"?").c_str());
     PropVariantClear(&name);
     if (state != DEVICE_STATE_ACTIVE) continue;  // Never activate an inactive endpoint.
+    printf("  MatConfigured=%d MatTransportSupported=%d\n", sonic_live::configured_mat(devices[i].Get()), sonic_live::supports_mat(devices[i].Get()));
     ComPtr<IAudioClient> audio;
     HRESULT mixHr = devices[i]->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &audio);
     WAVEFORMATEX *mix = nullptr;
@@ -245,6 +249,39 @@ Emit(IMMDevice *dev, double seconds, unsigned objectCount, unsigned variant, boo
   AccessAudit();
 }
 
+static void
+Sessions(const std::vector<ComPtr<IMMDevice>> &devices) {
+  for (const auto &device : devices) {
+    DWORD state = 0;
+    Check(device->GetState(&state), "Session endpoint state");
+    if (state != DEVICE_STATE_ACTIVE) continue;
+    LPWSTR id = nullptr;
+    Check(device->GetId(&id), "Session endpoint ID");
+    std::string endpoint = Utf8(id);
+    CoTaskMemFree(id);
+    ComPtr<IAudioSessionManager2> manager;
+    Check(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &manager), "AudioSessionManager");
+    ComPtr<IAudioSessionEnumerator> sessions;
+    Check(manager->GetSessionEnumerator(&sessions), "AudioSessionEnumerator");
+    int count = 0;
+    Check(sessions->GetCount(&count), "AudioSessionCount");
+    for (int index = 0; index < count; ++index) {
+      ComPtr<IAudioSessionControl> control;
+      Check(sessions->GetSession(index, &control), "AudioSession");
+      ComPtr<IAudioSessionControl2> details;
+      Check(control.As(&details), "AudioSessionControl2");
+      DWORD pid = 0;
+      AudioSessionState sessionState;
+      Check(details->GetProcessId(&pid), "AudioSessionProcess");
+      Check(details->GetState(&sessionState), "AudioSessionState");
+      ComPtr<IAudioMeterInformation> meter;
+      float peak = -1;
+      if (SUCCEEDED(control.As(&meter))) meter->GetPeakValue(&peak);
+      printf("SESSION endpoint=%s pid=%lu state=%u peak=%g\n", endpoint.c_str(), pid, sessionState, peak);
+    }
+  }
+}
+
 int
 wmain(int argc, wchar_t **argv) {
   SetConsoleOutputCP(CP_UTF8);
@@ -256,6 +293,8 @@ wmain(int argc, wchar_t **argv) {
   bool accessOnly = false;
   bool all = false;
   bool bed714 = false;
+  bool longRun = false;
+  bool sessions = false;
   std::wstring endpoint;
   std::wstring gateName;
   for (int i = 1; i < argc; ++i) {
@@ -272,6 +311,10 @@ wmain(int argc, wchar_t **argv) {
       all = true;
     else if (a == L"--bed-7.1.4")
       bed714 = true;
+    else if (a == L"--long-run")
+      longRun = true;
+    else if (a == L"--sessions")
+      sessions = true;
     else if (a == L"--endpoint" && i + 1 < argc)
       endpoint = argv[++i];
     else if (a == L"--objects" && i + 1 < argc)
@@ -283,7 +326,7 @@ wmain(int argc, wchar_t **argv) {
     else if (a != L"--list")
       return 2;
   }
-  if (!std::isfinite(seconds) || seconds <= 0 || seconds > 60) return 2;
+  if (!std::isfinite(seconds) || seconds <= 0 || seconds > (longRun ? 3600 : 60)) return 2;
   try {
     if (accessOnly) {
       AccessAudit();
@@ -297,7 +340,7 @@ wmain(int argc, wchar_t **argv) {
       if (wait != WAIT_OBJECT_0) throw std::runtime_error("Gate timeout");
     }
     Check(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "CoInitializeEx");
-    if (all && emit) return 2;
+    if ((all || sessions) && emit) return 2;
     auto devices = Devices(all ? DEVICE_STATEMASK_ALL : DEVICE_STATE_ACTIVE);
     if (!endpoint.empty()) {
       if (device != -1) return 2;
@@ -318,6 +361,9 @@ wmain(int argc, wchar_t **argv) {
       if ((!bed714 && objectCount < 1) || objectCount > 2) return 2;
       if (variant > 1) return 2;
       Emit(devices[device].Get(), seconds, objectCount, variant, bed714);
+    }
+    else if (sessions) {
+      Sessions(devices);
     }
     else {
       List(devices);

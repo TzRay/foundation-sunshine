@@ -1,7 +1,8 @@
 #pragma once
 #include "protocol.h"
 namespace q4 {
-  constexpr uint32_t version = 5, backend = 5, magic = 0x3451424f, domainCapacity = 8, objectCapacity = 64;
+  constexpr uint32_t version = 7, backend = 5, magic = 0x3451424f, domainCapacity = 8, objectCapacity = 64;
+  enum Fault : LONG { InvalidRecord = 1, RenderBinding, NestedRender, RenderFrames, ExtendedSubmit, UnboundCallback };
   enum Kind : uint32_t { DomainBegin = 1,
     DomainEnd,
     PassBegin,
@@ -25,7 +26,7 @@ namespace q4 {
     uint64_t lossEpoch, renderer, encoder, implementation, domain, pass, call;
     uint32_t inputFrames, producedBytes, capacity;
     int32_t result;
-    uint32_t reason, reserved;
+    uint32_t reason, contentType;
   };
 #pragma pack(pop)
   static_assert(sizeof(Header) == 160);
@@ -41,6 +42,7 @@ namespace q4 {
   struct alignas(64) Ring: RingT<Slot> {
     alignas(64) volatile LONG64 ignoredBeforeFirstRender, unboundAfterArming;
     volatile LONG64 domainsOpened, domainsClosed, submitResults, processResults;
+    volatile LONG firstFault, faultArg1, faultArg2, faultArg3;
   };
   static_assert(offsetof(Ring, write) == 64);
   inline bool

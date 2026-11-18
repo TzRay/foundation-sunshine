@@ -9,7 +9,7 @@
 #include <type_traits>
 
 namespace receiver {
-  constexpr uint32_t magic = 0x3149504d, version = 1, capacity = 32, frameMagic = 0x3146504d;
+  constexpr uint32_t magic = 0x3149504d, version = 2, capacity = 32, frameMagic = 0x3146504d;
   constexpr uint32_t callCapacity = 64, frames = 480, request = 30720;
   // Windows AudioObjectType bits: FL/FR/FC/LFE/SL/SR/BL/BR/TFL/TFR/TBL/TBR.
   // This is an input bed, not the eight-channel IEC carrier layout.
@@ -61,7 +61,9 @@ namespace receiver {
   };
 #pragma pack(pop)
   struct Call {
-    uint32_t id, slot, type, flags;
+    // contentType is the observed Windows stream description, not an Atmos flag.
+    // Plain loopback PCM has no such description and keeps the zero default.
+    uint32_t id, contentType, type, flags;
     float xyz[3];
     uint32_t frames;
     float pcm[480];

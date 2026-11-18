@@ -49,7 +49,8 @@ extern "C" {
 #include "streaming/audio_budget.h"
 #include "streaming/fec.h"
 #include "sync.h"
-#include "spatial_transport/mat_live_session.h"
+#include "spatial_transport/mat_source_preparation.h"
+#include "spatial_audio/mat_manager_control.h"
 #include "video.h"
 
 namespace asio = boost::asio;
@@ -235,8 +236,10 @@ namespace rtsp_stream {
   print_msg(PRTSP_MESSAGE msg);
   void
   cmd_not_found(tcp::socket &sock, launch_session_t &, msg_t &&req);
-  void
+  bool
   respond(tcp::socket &sock, launch_session_t &session, POPTION_ITEM options, int statuscode, const char *status_msg, int seqn, const std::string_view &payload);
+  bool
+  cmd_describe(rtsp_server_t *, tcp::socket &, launch_session_t &, msg_t &&);
 
   class socket_t: public std::enable_shared_from_this<socket_t> {
   public:
@@ -245,7 +248,7 @@ namespace rtsp_stream {
     using release_claim_fn_t = std::function<void(std::uint32_t)>;
 
     socket_t(boost::asio::io_context &io_context,
-             std::function<void(tcp::socket &sock, launch_session_t &, msg_t &&)> &&handle_data_fn,
+             std::function<void(std::shared_ptr<socket_t>, msg_t &&)> &&handle_data_fn,
              claim_plaintext_fn_t &&claim_plaintext_fn,
              claim_encrypted_fn_t &&claim_encrypted_fn,
              release_claim_fn_t &&release_claim_fn):
@@ -657,10 +660,10 @@ namespace rtsp_stream {
     void
     handle_data(msg_t &&req) {
       handshake_timer.cancel();
-      handle_data_fn(sock, *session, std::move(req));
+      handle_data_fn(shared_from_this(), std::move(req));
     }
 
-    std::function<void(tcp::socket &sock, launch_session_t &, msg_t &&)> handle_data_fn;
+    std::function<void(std::shared_ptr<socket_t>, msg_t &&)> handle_data_fn;
     claim_plaintext_fn_t claim_plaintext_fn;
     claim_encrypted_fn_t claim_encrypted_fn;
     release_claim_fn_t release_claim_fn;
@@ -668,7 +671,8 @@ namespace rtsp_stream {
     tcp::socket sock;
     boost::asio::steady_timer handshake_timer;
 
-    std::array<char, 2048> msg_buf;
+    // MAT profile attributes plus the client extensions can exceed 2 KiB.
+    std::array<char, 8192> msg_buf;
 
     char *crlf;
     char *begin = msg_buf.data();
@@ -677,6 +681,20 @@ namespace rtsp_stream {
 
     std::shared_ptr<launch_session_t> session;
   };
+
+  unsigned mat_request_count(const msg_t &req) {
+    unsigned live_requests = 0;
+    for (auto item = req->options; item; item = item->next) {
+      if (boost::iequals(item->option, "X-ML-Mat-Live")) {
+        if ((item->flags & FLAG_DUPLICATE_OPTION) || std::string_view(item->content) != "1") {
+          live_requests = 2;
+          break;
+        }
+        ++live_requests;
+      }
+    }
+    return live_requests;
+  }
 
   class rtsp_server_t {
   public:
@@ -688,8 +706,8 @@ namespace rtsp_stream {
     make_socket() {
       return std::make_shared<socket_t>(
         io_context,
-        [this](tcp::socket &sock, launch_session_t &session, msg_t &&msg) {
-          handle_msg(sock, session, std::move(msg));
+        [this](std::shared_ptr<socket_t> socket, msg_t &&msg) {
+          handle_msg(std::move(socket), std::move(msg));
         },
         [this](std::string_view remote_address) {
           return _launch_sessions.claim_plaintext(remote_address);
@@ -739,8 +757,52 @@ namespace rtsp_stream {
       return 0;
     }
 
+    static void mat_unavailable(socket_t &socket, const msg_t &req) {
+      OPTION_ITEM seq {};
+      auto cseq = std::to_string(req->sequenceNumber);
+      seq.option = const_cast<char *>("CSeq");
+      seq.content = cseq.data();
+      respond(socket.sock, *socket.session, &seq, 503, "MAT source unavailable", req->sequenceNumber, {});
+    }
+
     void
-    handle_msg(tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    handle_msg(std::shared_ptr<socket_t> socket, msg_t &&req) {
+      auto &sock = socket->sock;
+      auto &session = *socket->session;
+      if ("DESCRIBE"sv == req->message.request.command && mat_request_count(req) == 1 &&
+          config::audio.mat_live && !session.mat_live && config::audio.stream && !session.control_only) {
+        const auto deadline = std::chrono::steady_clock::now() + 12s;
+        const auto prepare = [deadline](const std::function<bool()> &cancelled) {
+#ifdef _WIN32
+          spatial_audio::require(!spatial_audio::NativeMatPipeSource::busy(spatial_audio::mat_auto_pipe), "MAT source already leased");
+          spatial_audio::request_mat_manager(deadline, cancelled);
+#endif
+          return spatial_transport::prepare_live(spatial_audio::mat_auto_pipe, {}, true, deadline, cancelled);
+        };
+        const auto valid = [this](const socket_t &peer) { return _launch_sessions.claimed(peer.session); };
+        const auto reply = [this](socket_t &peer, msg_t &request, std::shared_ptr<spatial_transport::LiveSession> live, const char *error) {
+          if (!live) {
+            spatial_audio::mat_live_status.failed(error);
+            BOOST_LOG(warning) << "Requested MAT is unavailable: " << error;
+            mat_unavailable(peer, request);
+            return;
+          }
+          auto &launch = *peer.session;
+          launch.mat_live = std::move(live);
+          launch.mat_live_described = true;
+          auto release = util::fail_guard([&] {
+            launch.mat_live.reset();
+            launch.mat_live_described = false;
+          });
+          try {
+            if (cmd_describe(this, peer.sock, launch, std::move(request))) release.disable();
+          } catch (const boost::system::system_error &e) {
+            BOOST_LOG(debug) << "MAT DESCRIBE peer disconnected: " << e.what();
+          }
+        };
+        if (!mat_preparation.begin(socket, std::move(req), deadline, prepare, valid, reply)) mat_unavailable(*socket, req);
+        return;
+      }
       auto func = _map_cmd_cb.find(req->message.request.command);
       if (func != std::end(_map_cmd_cb)) {
         func->second(this, sock, session, std::move(req));
@@ -1017,6 +1079,8 @@ namespace rtsp_stream {
     /**
      * @brief Stop the RTSP server.
      */
+    void finish_mat_shutdown() { mat_preparation.shutdown(); }
+
     void
     stop() {
       acceptor.close();
@@ -1033,6 +1097,7 @@ namespace rtsp_stream {
     tcp::acceptor acceptor { io_context };
     boost::asio::steady_timer raised_timer { io_context };
 
+    spatial_transport::MatSourcePreparation<socket_t, msg_t> mat_preparation { io_context };
     std::shared_ptr<socket_t> next_socket;
   };
 
@@ -1103,7 +1168,7 @@ namespace rtsp_stream {
     return 0;
   }
 
-  void
+  bool
   respond(tcp::socket &sock, launch_session_t &session, msg_t &resp) {
     auto payload = std::make_pair(resp->payload, resp->payloadLength);
 
@@ -1158,27 +1223,27 @@ namespace rtsp_stream {
       session.rtsp_cipher->encrypt(std::string_view { (const char *) header->payload(), (std::size_t) payload_length }, header->tag, &iv);
 
       // Send the full encrypted message
-      send(sock, std::string_view { (char *) message.data(), message.size() });
+      return send(sock, std::string_view { (char *) message.data(), message.size() }) == 0;
     }
     else {
       std::string_view tmp_resp { raw_resp.get(), (size_t) serialized_len };
 
       // Send the plaintext RTSP message header
       if (send(sock, tmp_resp)) {
-        return;
+        return false;
       }
 
       // Send the plaintext RTSP message payload (if present)
-      send(sock, std::string_view { payload.first, (std::size_t) payload.second });
+      return send(sock, std::string_view { payload.first, (std::size_t) payload.second }) == 0;
     }
   }
 
-  void
+  bool
   respond(tcp::socket &sock, launch_session_t &session, POPTION_ITEM options, int statuscode, const char *status_msg, int seqn, const std::string_view &payload) {
     msg_t resp { new msg_t::element_type };
     createRtspResponse(resp.get(), nullptr, 0, const_cast<char *>("RTSP/1.0"), statuscode, const_cast<char *>(status_msg), seqn, options, const_cast<char *>(payload.data()), (int) payload.size());
 
-    respond(sock, session, resp);
+    return respond(sock, session, resp);
   }
 
   void
@@ -1199,7 +1264,7 @@ namespace rtsp_stream {
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 
-  void
+  bool
   cmd_describe(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     OPTION_ITEM option {};
 
@@ -1259,24 +1324,10 @@ namespace rtsp_stream {
     }
 
     // Report supported and required encryption flags
-    unsigned live_requests = 0;
-    for (auto item = req->options; item; item = item->next) {
-      if (boost::iequals(item->option, "X-ML-Mat-Live")) {
-        if (std::string_view(item->content) != "1") {
-          live_requests = 2;
-          break;
-        }
-        ++live_requests;
-      }
-    }
-    if (live_requests == 1 && !session.mat_live_described && config::audio.stream && !session.control_only) {
-      session.mat_live_described = true;
-      try {
-        if (config::audio.mat_live) session.mat_live = spatial_transport::prepare_live(spatial_audio::mat_auto_pipe, {});
-      }
-      catch (const std::exception &e) {
-        BOOST_LOG(warning) << "Live MAT not ready; client may select Opus: " << e.what();
-      }
+    const auto live_requests = mat_request_count(req);
+    if (live_requests > 1) {
+      respond(sock, session, &option, 400, "Invalid MAT request", req->sequenceNumber, {});
+      return false;
     }
     if (live_requests == 1 && session.mat_live) ss << spatial_transport::describe_live(*session.mat_live);
 
@@ -1389,7 +1440,7 @@ namespace rtsp_stream {
       ss << std::endl;
     }
 
-    respond(sock, session, &option, 200, "OK", req->sequenceNumber, ss.str());
+    return respond(sock, session, &option, 200, "OK", req->sequenceNumber, ss.str());
   }
 
   void
@@ -1504,8 +1555,8 @@ namespace rtsp_stream {
   };
 
   struct mat_live_response_headers_t {
-    std::string live_epoch, live_domain;
-    OPTION_ITEM codec {}, carrier {}, clock {}, crypto {}, epoch {}, domain {};
+    std::string live_epoch, live_domain, live_ssrc;
+    OPTION_ITEM codec {}, carrier {}, clock {}, crypto {}, epoch {}, domain {}, recovery {}, ssrc {};
     mat_live_response_headers_t(const launch_session_t &session) {
       if (session.mat_live_selected && session.mat_live) {
         live_epoch = std::to_string(session.mat_live->profile.epoch);
@@ -1527,6 +1578,17 @@ namespace rtsp_stream {
         clock.next = &crypto;
         crypto.next = &epoch;
         epoch.next = &domain;
+        if (session.mat_live->recovery_selected) {
+          recovery.option = const_cast<char *>("X-SS-Mat-Live-Recovery");
+          recovery.content = const_cast<char *>(session.mat_live->recovery_selected == 2 ? "2" : "1");
+          domain.next = &recovery;
+          if (session.mat_live->recovery_selected == 2) {
+            live_ssrc = std::to_string(session.mat_live->ssrc);
+            ssrc.option = const_cast<char *>("X-SS-Mat-Live-Ssrc");
+            ssrc.content = live_ssrc.data();
+            recovery.next = &ssrc;
+          }
+        }
         return;
       }
     }
@@ -1688,6 +1750,10 @@ namespace rtsp_stream {
           return;
         }
         if (codecStr != MAT_LIVE_NAME) {
+          if (session.mat_live_described && config::audio.mat_live) {
+            respond(sock, session, &option, 415, "Requested MAT cannot fall back to another codec", req->sequenceNumber, {});
+            return;
+          }
           session.mat_live.reset();
         }
         if (codecStr == MAT_LIVE_NAME) {
@@ -1716,6 +1782,12 @@ namespace rtsp_stream {
           }
           config.audio.codec = audio::CODEC_MAT_LIVE;
           config.audio.mat_live = session.mat_live;
+          const auto recovery = value("x-ml-audio.mat-live-recovery");
+          if (!recovery.empty() && ((recovery != "1" && recovery != "2") || !session.mat_live->recovery_supported)) {
+            respond(sock, session, &option, 415, "MAT audio recovery unavailable", req->sequenceNumber, {});
+            return;
+          }
+          config.audio.mat_live_recovery = session.mat_live->recovery_selected = recovery == "2" ? 2 : recovery == "1" ? 1 : 0;
           config.audio.packetDuration = 1;  // FEC transport tick; media PTS is in the authenticated envelope.
         }
         else if (codecStr.starts_with("mat-")) {
@@ -1789,6 +1861,11 @@ namespace rtsp_stream {
       }
       config.minRequiredFecPackets = getArg("x-nv-vqos[0].fec.minRequiredFecPackets"sv);
       config.mlFeatureFlags = getArg("x-ml-general.featureFlags"sv);
+      if (config.audio.mat_live_recovery &&
+          (config.controlProtocolType != 13 || !(config.mlFeatureFlags & ML_FF_SESSION_ID_V1))) {
+        respond(sock, session, &option, 415, "MAT recovery requires authenticated control and session ping", req->sequenceNumber, {});
+        return;
+      }
       BOOST_LOG(debug) << "Moonlight feature flags: 0x" << std::hex << config.mlFeatureFlags
                       << std::dec << ", remote_text_context="
                       << ((config.mlFeatureFlags & ML_FF_REMOTE_TEXT_CONTEXT) != 0);
@@ -2282,6 +2359,7 @@ namespace rtsp_stream {
     // Stop the server and join the server thread
     server.stop();
     rtsp_thread.join();
+    server.finish_mat_shutdown();
   }
 
   void

@@ -58,8 +58,10 @@ HookRender4(void *renderer, uint32_t inputs, void *input, uint32_t outputs, void
     InterlockedIncrement64(&ring->renderCalls);
     uint64_t encoder = 0, implementation = 0;
     uint32_t frames = 0;
-    if (previous || !binding4(renderer, inputs, input, encoder, implementation, frames))
-      recorder4.fail();
+    if (previous)
+      recorder4.fail(q4::NestedRender);
+    else if (!binding4(renderer, inputs, input, encoder, implementation, frames))
+      recorder4.fail(q4::RenderBinding, inputs, outputs, frames);
     else if (recorder4.begin(reinterpret_cast<uint64_t>(renderer), encoder, implementation, frames, local))
       pass4 = &local;
   }
@@ -106,7 +108,7 @@ HookExtended4(void *encoder, const void *info, const void *properties, const voi
   auto *ring = currentRing4();
   if (admitted4(ring, pass4)) {
     InterlockedIncrement64(&ring->extendedCalls);
-    recorder4.fail();
+    recorder4.fail(q4::ExtendedSubmit);
   }
   HRESULT result = E_UNEXPECTED;
   __try {

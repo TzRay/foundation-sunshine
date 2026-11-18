@@ -83,6 +83,17 @@ Set-Content -LiteralPath $state.captureLog -Value ''
 Check-Status 'WaitingForObjects'
 Set-Content -LiteralPath $state.captureLog -Value 'NATIVE_MAT_READY source=test-state-only'
 Check-Status 'NativeReady'
+$state.source='bed'
+Set-Content -LiteralPath $state.captureLog -Value ''
+Check-Status 'WaitingForPCM'
+$state.publisherPid=2147483000
+Set-Content -LiteralPath $state.captureLog -Value 'BED_STOP verified=1 blocks=100 sourceFrames=48000 hooksInstalled=0'
+Check-Status 'StoppedVerified'
+(& $control -Action Stop -Metadata "$out/capture.json")|Out-Null
+Set-Content -LiteralPath $state.captureLog -Value 'BED_FAILED BED_DISCONTINUITY'
+Check-Status 'Faulted'
+[void]$state.Remove('source')
+$state.publisherPid=$PID
 $state.publisherCreated='1';Save-State
 $rejected=$false;try{& $control -Action Stop -Metadata "$out/capture.json"|Out-Null}catch{$rejected=$true}
 if(!$rejected){throw 'Changed process identity was accepted'}

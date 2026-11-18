@@ -22,6 +22,11 @@ foreach($duration in @('nan','NaN','inf','-inf','0','61')){
  ++$case
 }
 $global:LASTEXITCODE=0
+foreach($duration in @('nan','0','11')){
+ & "$out/bed-probe.exe" --seconds $duration *> "$out/bed-duration-$duration.log"
+ if($LASTEXITCODE -ne 2){throw "Bed probe accepted invalid duration: $duration"}
+}
+$global:LASTEXITCODE=0
 # These hashes are the runtime trust manifest, not a test evidence inventory.
 $binaries=@('sunshine-plugin-mat-capture.exe','sunshine-plugin-object-tap.dll','sunshine-sonic-mat-worker.dll') | ForEach-Object {
  @{name=$_;sha256=(Get-FileHash -LiteralPath "$out/$_").Hash.ToLower()}

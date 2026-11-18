@@ -60,6 +60,7 @@ namespace audio {
 
   struct config_t {
     std::shared_ptr<spatial_transport::LiveSession> mat_live;
+    unsigned mat_live_recovery = 0;
     enum flags_e : int {
       HIGH_QUALITY,  ///< High quality audio
       HOST_AUDIO,  ///< Host audio

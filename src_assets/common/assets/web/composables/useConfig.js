@@ -71,6 +71,7 @@ const DEFAULT_TABS = [
       audio_sink: '',
       virtual_sink: '',
       mat_live: 'disabled',
+      mat_source: 'objects',
       keep_sink_default: false,
       microphone_redirect_backend: 'vb_cable',
       stream_mic: true,

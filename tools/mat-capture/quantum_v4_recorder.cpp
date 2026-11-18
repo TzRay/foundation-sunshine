@@ -17,8 +17,13 @@ namespace q4 {
     for (auto &binding : bindings_) binding = Binding {};
   }
   void
-  Recorder::fail() {
+  Recorder::fail(LONG reason, LONG arg1, LONG arg2, LONG arg3) {
     if (!ring_) return;
+    if (InterlockedCompareExchange(&ring_->firstFault, reason, 0) == 0) {
+      InterlockedExchange(&ring_->faultArg1, arg1);
+      InterlockedExchange(&ring_->faultArg2, arg2);
+      InterlockedExchange(&ring_->faultArg3, arg3);
+    }
     InterlockedIncrement64(&loss_);
     InterlockedIncrement64(&ring_->invalid);
     InterlockedExchange(&ring_->stop, 1);
@@ -133,7 +138,7 @@ namespace q4 {
     pass = Pass {};
     if (!ring_ || ring_->stop) return false;
     if (!renderer || !encoder || !implementation || !frames || frames > kSamples) {
-      fail();
+      fail(RenderFrames, !!renderer && !!encoder && !!implementation, static_cast<LONG>(frames), kSamples);
       return false;
     }
     Binding *binding = acquire(encoder, true);
@@ -204,6 +209,9 @@ namespace q4 {
     __try {
       const auto *bytes = static_cast<const BYTE *>(properties);
       memcpy(&value.audio.host, static_cast<const BYTE *>(info) + 4, 8);
+      // MainPluginRenderer copies ISpatialAudioProcessBlockRT::GetContentType
+      // here. Preserve the source value before the original Submit can mutate it.
+      memcpy(&value.contentType, static_cast<const BYTE *>(info) + 12, 4);
       memcpy(&value.audio.objectId, bytes, 4);
       memcpy(&value.audio.type, bytes + 8, 4);
       memcpy(&value.properties, bytes + 12, 4);
@@ -296,7 +304,7 @@ namespace q4 {
       InterlockedIncrement64(&ring_->ignoredBeforeFirstRender);
     else {
       InterlockedIncrement64(&ring_->unboundAfterArming);
-      fail();
+      fail(UnboundCallback);
     }
   }
   void

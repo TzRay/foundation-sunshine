@@ -43,6 +43,7 @@ struct Renderer4 {
   Encoder4 *encoder;
 };
 static unsigned sourceObjects4 = 1, sourceFlags4 = 6, submitCalls4 = 0, processCalls4 = 0, destroyCalls4 = 0, resetCalls4 = 0;
+static uint32_t sourceContentType4 = 4;
 static float sourceX4 = 1;
 static HRESULT submitResult4 = S_OK, resetResult4 = S_OK;
 static uint32_t producedBytes4 = 0;
@@ -91,6 +92,7 @@ FakeSubmit4(void *encoder, const void *info, const void *properties, const float
     lastProperties4 = *p;
     uint64_t changed = 999;
     memcpy(static_cast<BYTE *>(const_cast<void *>(info)) + 4, &changed, 8);
+    memcpy(static_cast<BYTE *>(const_cast<void *>(info)) + 12, &changed, 4);
   }
   return submitResult4;
 }
@@ -114,9 +116,10 @@ FakeRender4(void *object, uint32_t, void *input, uint32_t, void *) {
   auto *renderer = static_cast<Renderer4 *>(object);
   auto *connection = *static_cast<Connection4 **>(input);
   for (unsigned n = 0; n < sourceObjects4; ++n) {
-    uint8_t info[12] {};
+    uint8_t info[16] {};
     uint64_t host = 77;
     memcpy(info + 4, &host, 8);
+    memcpy(info + 12, &sourceContentType4, 4);
     const uint32_t type = sourceBed4 && n < 12 ? 1u << (n + 1) : 1;
     Properties4 p { 42 + n, connection->frames, type, sourceFlags4, sourceX4, 2, 3, .5f };
     float samples[kSamples];
@@ -157,6 +160,7 @@ struct Fixture4 {
     originalDestroy4 = FakeDestroy4;
     sourceObjects4 = 1;
     sourceFlags4 = 6;
+    sourceContentType4 = 4;
     sourceX4 = 1;
     submitCalls4 = processCalls4 = destroyCalls4 = resetCalls4 = 0;
     submitResult4 = resetResult4 = S_OK;
@@ -255,7 +259,7 @@ ParallelRender4(void *object, uint32_t, void *, uint32_t, void *) {
   overlap4->arrive_and_wait();  // Force distinct encoder passes to overlap in originals.
   auto *renderer = static_cast<Renderer4 *>(object);
   if (parallelIndex4 == 0 && (!parallelMissingTail4 || parallelRound4 != 1299)) {
-    uint8_t info[12] {};
+    uint8_t info[16] {};
     uint64_t host = 77;
     memcpy(info + 4, &host, 8);
     Properties4 p { 42, 480, 1, 6, 1, 2, 3, .5f };
@@ -356,6 +360,28 @@ main(int argc, char **argv) {
   unsigned tests = 0;
   auto test = [&](const char *name, auto fn) {try{fn();++tests;}catch(...){printf("FAILED %s\n",name);throw;} };
   try {
+    test("source_content_type_survives_original_mutation", [] {
+      Fixture4 f;
+      f.render(f.rendererA);
+      sourceContentType4 = 2;
+      f.render(f.rendererA);
+      f.finish();
+      auto q = f.parse();
+      require4(q.size() == 2 && q[0].objects[0].source.contentType == 4 &&
+                 q[1].objects[0].source.contentType == 2, "source content type lost before re-encoding");
+      sonic_live::PluginBridge bridge;
+      unsigned count = 0;
+      const uint32_t expected[] { 4, 2, 2 };
+      auto emit = [&](const receiver::Slot &packet) {
+        require4(count < 3 && packet.header.calls == 1 &&
+                   packet.calls[0].contentType == expected[count++], "bridge lost source content type or EOS");
+        return true;
+      };
+      bridge.push(q[0], 1, 1, 48000, emit);
+      bridge.push(q[1], 2, 2, 48000, emit);
+      bridge.finish(emit);
+      require4(count == 3, "missing content type packets");
+    });
     test("before_PCM_and_metadata_survive_original_inplace_mutation", [] {Fixture4 f;f.render(f.rendererA);f.finish();auto q=f.parse();require4(q.size()==1&&q[0].objects.size()==1,"missing pass");auto& o=q[0].objects[0];require4(lastProperties4.x==99&&lastMutated4!=o.pcm.back(),"fake original did not mutate");require4(o.source.audio.host==77&&o.source.audio.x==1&&o.source.audio.volume==.5f&&o.source.properties==6,"post-call metadata leaked");for(unsigned i=0;i<480;++i)require4(o.pcm[i]==float(i)*.001f,"post-gain PCM leaked");require4(o.resultSeen&&o.source.result==E_PENDING&&submitCalls4==1&&processCalls4==1,"status not separately paired"); });
     test("worker_cannot_commit_until_result_and_end", [] {Fixture4 f;q4::Assembler parser;duringOriginal4=&parser;checkPending4=true;f.render(f.rendererA);f.finish();unsigned completed=0;for(uint64_t i=duringRead4;i<static_cast<uint64_t>(f.ring->write);++i){auto& s=f.ring->slots[i];q4::Quantum q;completed+=parser.push(s.header,s.pcm,q);}parser.finish();require4(completed==1,"incomplete or duplicate commit"); });
     test("normal_stop_drains_admitted_pass_and_admits_no_new_pass", [] {Fixture4 f;stopInOriginal4=true;f.render(f.rendererA);auto events=f.ring->write;require4(f.ring->stop&&!f.ring->invalid&&captureAdmissions4==0,"stop interrupted admitted pass");f.render(f.rendererA);require4(f.ring->write==events&&!f.ring->invalid,"new pass admitted after stop");f.finish();auto q=f.parse();require4(q.size()==1&&q[0].objects[0].resultSeen,"stop lost paired return or Process"); });
@@ -518,6 +544,57 @@ main(int argc, char **argv) {
       bridge.push(q[1], 2, 2, 48000, emit);
       bridge.finish(emit);
       require4(emitted == 3 && bridge.samples() == 14 * 2 * 480, "bed sample count/EOS");
+    });
+    test("hrtf_update_bit_preserves_MAT_properties_and_lifecycle", [] {
+      Fixture4 f;
+      sourceBed4 = true;
+      sourceObjects4 = 14;
+      sourceFlags4 = 0x13; // The static-channel flags observed in the real capture.
+      f.render(f.rendererA);
+      sourceFlags4 = 0x16;
+      sourceX4 = 9;
+      f.render(f.rendererA);
+      sourceFlags4 = 0x10; // HRTF-only update must retain volume and position.
+      sourceX4 = 99;
+      f.render(f.rendererA);
+      f.finish();
+      auto events = events4(f);
+      // A new dynamic object also supplies its position; static objects do not.
+      for (auto &event : events)
+        if (event.header.kind == q4::ObjectBefore && event.header.pass == 1 && event.header.audio.type == 1)
+          event.header.properties = 0x17;
+      auto quanta = parseEvents4(events);
+      require4(quanta.size() == 3 && quanta[0].objects[0].source.properties == 0x13, "HRTF raw property flags lost");
+      sonic_live::PluginBridge bridge;
+      unsigned emitted = 0;
+      auto emit = [&](const receiver::Slot &packet) {
+        require4(packet.header.calls == 14, "HRTF update lost objects");
+        for (unsigned n = 0; n < 14; ++n) {
+          const auto &c = packet.calls[n];
+          const auto type = n < 12 ? 1u << (n + 1) : 1u;
+          require4(c.id == n + 1 && c.type == type && c.contentType == 4, "HRTF update changed identity or source category");
+          require4(c.flags == (emitted == 3 ? 8u : emitted ? receiver::updateFlags(type) : receiver::createFlags(type)), "HRTF bit changed MAT lifecycle");
+          if (emitted < 3) {
+            require4(c.xyz[0] == (n < 12 ? 0.f : emitted ? 9.f : 1.f), "HRTF-only update replaced cached position");
+            for (unsigned s = 0; s < 480; ++s)
+              require4(c.pcm[s] == (float(s) * .001f + float(n) * .01f) * .125f, "HRTF update changed PCM or effective gain");
+          }
+        }
+        ++emitted;
+        return true;
+      };
+      for (unsigned n = 0; n < quanta.size(); ++n) bridge.push(quanta[n], n + 1, n + 1, 48000, emit);
+      bridge.finish(emit);
+      require4(emitted == 4 && bridge.samples() == 14 * 3 * 480, "HRTF update changed sample clock or EOS");
+    });
+    test("hrtf_update_does_not_allow_suppression_or_unknown_property_flags", [] {
+      for (const auto flags : { 0x20u, 0x33u, 0x40u, 0x80000013u }) {
+        Fixture4 f;
+        sourceFlags4 = flags;
+        f.render(f.rendererA);
+        f.finish();
+        rejects4([&] { f.parse(); });
+      }
     });
     test("missing_LFE_is_rejected_without_filling_silence", [] {
       Fixture4 f;

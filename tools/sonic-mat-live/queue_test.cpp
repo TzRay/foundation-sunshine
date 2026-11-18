@@ -1,11 +1,11 @@
 // Generated own-process plugin objects -> real IPC receiver's FAKE worker.
 // This test never loads a vendor component or attaches to an audio engine.
 #define NOMINMAX
-#include "plugin_bridge.h"
 #include "native_queue.h"
-#include <thread>
+#include "plugin_bridge.h"
 #include <atomic>
 #include <iostream>
+#include <thread>
 static void
 Check(bool b) {
   if (!b) throw std::runtime_error("Plugin IPC integration assertion");
@@ -13,10 +13,17 @@ Check(bool b) {
 int
 wmain(int argc, wchar_t **argv) {
   try {
-    Check(argc == 2 || (argc == 3 && std::wstring(argv[2]) == L"--bed-7.1.4"));
-    const bool bed = argc == 3;
+    Check(argc == 2 || (argc == 3 && (std::wstring(argv[2]) == L"--bed-7.1.4" || std::wstring(argv[2]) == L"--source-clock")));
+    const bool bed = argc == 3 && std::wstring(argv[2]) == L"--bed-7.1.4";
+    const bool sourceClock = argc == 3 && !bed;
+    const auto captureOrigin = receiver::qpc();
+    const unsigned rounds = sourceClock ? 130 : 1300;
     const unsigned lanes = bed ? 14u : 1u;
     auto type = [&](unsigned n) { return bed && n < 12 ? 1u << (n + 1) : 1u; };
+    auto contentType = [](unsigned round, unsigned lane) {
+      constexpr uint32_t values[] { 4, 2, 0 };
+      return values[(round / 13 + lane) % 3];
+    };
     HANDLE inputMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(receiver::Shared), nullptr);
     HANDLE outputMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(spatial_stream::Output), nullptr);
     auto *input = (receiver::Shared *) MapViewOfFile(inputMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(receiver::Shared));
@@ -29,11 +36,13 @@ wmain(int argc, wchar_t **argv) {
     FILETIME created {}, exit {}, kernel {}, user {};
     Check(GetProcessTimes(GetCurrentProcess(), &created, &exit, &kernel, &user) != FALSE);
     spatial_stream::Args args { sizeof(args), spatial_stream::streamVersion, inputMap, data, cancel, GetCurrentProcess(), outputMap, 7, 11, { nonce[0], nonce[1] }, (uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime, GetCurrentProcessId(), 0, 0, 0 };
+    args.sourceDriven = sourceClock;
     auto dll = LoadLibraryW(argv[1]);
     Check(dll != nullptr);
     auto start = (spatial_stream::FakeStart) GetProcAddress(dll, "TestMatStreamReceiverFake");
     Check(start != nullptr);
     spatial_stream::FakeConfig config { sizeof(config), spatial_stream::streamVersion, 0, -1, -1, 0, 0 };
+    config.paceMs = sourceClock ? 10 : 0;
     std::atomic<DWORD> result = STILL_ACTIVE;
     std::thread worker([&] { result = start(&args, &config); });
     std::atomic<bool> failed = false;
@@ -45,11 +54,12 @@ wmain(int argc, wchar_t **argv) {
             if(status==spatial_stream::Poll::pending){Sleep(1);continue;}Check(status!=spatial_stream::Poll::failed);if(status==spatial_stream::Poll::ended)break;
             auto& b=slot->header;Check(b.format==spatial_stream::fakeFormat&&b.sampleStart==blocks*480);uint32_t phase,index,count;memcpy(&phase,slot->payload,4);memcpy(&index,slot->payload+4,4);memcpy(&count,slot->payload+8,4);
             Check(phase==b.phase&&index==b.sourceIndex);if(phase==2){Check(index==source&&count==lanes);
-                for(unsigned n=0;n<lanes;++n){auto* p=slot->payload+12+n*1940;uint32_t id,flags;memcpy(&id,p,4);memcpy(&flags,p+4,4);Check(id==n+1&&flags==receiver::updateFlags(type(n)));
-                    float xyz[3];memcpy(xyz,p+8,12);Check(xyz[0]==(type(n)==1?float(source%100)/100.f:0.f)&&xyz[1]==0&&xyz[2]==0);
-                    const float expected=(float(source%31)/100.f+float(n)*.01f)*(.3f*.5f);float pcm[480];memcpy(pcm,p+20,sizeof(pcm));for(auto f:pcm)Check(f==expected);}
+                Check(b.captureQpc>0);if(sourceClock)Check(b.captureQpc==captureOrigin+int64_t(source)*receiver::hz()/100);
+                for(unsigned n=0;n<lanes;++n){auto* p=slot->payload+12+n*1944;uint32_t id,flags,content;memcpy(&id,p,4);memcpy(&flags,p+4,4);memcpy(&content,p+8,4);Check(id==n+1&&flags==receiver::updateFlags(type(n))&&content==contentType(unsigned(source),n));
+                    float xyz[3];memcpy(xyz,p+12,12);Check(xyz[0]==(type(n)==1?float(source%100)/100.f:0.f)&&xyz[1]==0&&xyz[2]==0);
+                    const float expected=(float(source%31)/100.f+float(n)*.01f)*(.3f*.5f);float pcm[480];memcpy(pcm,p+24,sizeof(pcm));for(auto f:pcm)Check(f==expected);}
                 ++source;
-            }++blocks;
+            }else if(count){Check(count==lanes);for(unsigned n=0;n<lanes;++n){uint32_t content;memcpy(&content,slot->payload+12+n*1944+8,4);Check(content==contentType(phase==1?0:rounds-1,n));}}++blocks;
         }
     }catch(const std::exception& e){error=e.what();failed=true;SetEvent(cancel);} });
     sonic_live::PluginBridge bridge;
@@ -72,9 +82,9 @@ wmain(int argc, wchar_t **argv) {
         if(failed||receiver::get(input->common.fault)||GetTickCount64()>=until)return false;Sleep(1);
     }return true; };
     try {
-      for (unsigned n = 0; n < 1300; ++n) {
+      for (unsigned n = 0; n < rounds; ++n) {
         pass->sequence = n;
-        pass->firstQpc = receiver::qpc();
+        pass->firstQpc = sourceClock ? captureOrigin + int64_t(n) * receiver::hz() / 100 : receiver::qpc();
         pass->lastQpc = pass->firstQpc;
         o.xyz[0] = float(n % 100) / 100.f;
         for (auto &f : o.pcm) f = float(n % 31) / 100.f;
@@ -85,6 +95,7 @@ wmain(int argc, wchar_t **argv) {
         q.fullSpanLayoutReady = true;
         for (unsigned lane = 0; lane < lanes; ++lane) {
           q4::Object object;
+          object.source.contentType = contentType(n, lane);
           object.resultSeen = true;
           object.offset = 0;
           object.pcm.assign(480, float(n % 31) / 100.f + float(lane) * .01f);
@@ -115,8 +126,8 @@ wmain(int argc, wchar_t **argv) {
     }
     worker.join();
     reader.join();
-    Check(!failed && result == 0 && source == 1300 && blocks == 1350 && bridge.outputOnlyPasses() == 36 && output->header.eofSeen && output->header.fakeCallsVerified == 1321 * lanes && output->header.sourceSamples == 1300 * 480 * lanes && output->header.vendorLoads == 0 && output->header.hostGuardPassed == 0);
-    std::cout << "PASS object bridge -> actual IPC FAKE codec worker: lanes=" << lanes << ", 1300 source rounds, 36 output-only drains, 1350 output blocks, owned type/PCM/XYZ/gain exact; nativeCapture=0\n";
+    Check(!failed && result == 0 && source == rounds && blocks == rounds + 50 && bridge.outputOnlyPasses() == (rounds + 36) / 37 && output->header.eofSeen && output->header.fakeCallsVerified == (rounds + 21) * lanes && output->header.sourceSamples == rounds * 480 * lanes && output->header.vendorLoads == 0 && output->header.hostGuardPassed == 0);
+    std::cout << "PASS object bridge -> actual IPC FAKE codec worker: lanes=" << lanes << ", sourceRounds=" << rounds << ", sourceClock=" << sourceClock << ", owned type/contentType/PCM/XYZ/gain/timestamp exact; nativeCapture=0\n";
     FreeLibrary(dll);
     UnmapViewOfFile(input);
     UnmapViewOfFile(output);

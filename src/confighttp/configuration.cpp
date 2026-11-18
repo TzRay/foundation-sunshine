@@ -287,6 +287,9 @@ namespace confighttp::configuration {
         if (const auto mat = inputTree.get_optional<std::string>("mat_live"); mat && *mat != "true" && *mat != "false" && *mat != "enabled" && *mat != "disabled") {
           throw std::invalid_argument("mat_live must be enabled or disabled");
         }
+        if (const auto source = inputTree.get_optional<std::string>("mat_source"); source && *source != "bed" && *source != "native" && *source != "objects") {
+          throw std::invalid_argument("mat_source must be bed, native or objects");
+        }
         net::validate_bind_address(inputTree.get<std::string>("bind_address", ""), inputTree.get<std::string>("address_family", "ipv4"));
         const auto port_value = inputTree.get<std::string>("port", "47989");
         std::size_t consumed = 0;

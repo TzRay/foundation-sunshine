@@ -14,7 +14,7 @@ if (WIN32)
             ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/MatReceiver.c
             ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/MatDepacketizer.c)
     add_executable(mat_live_host_tests mat-live/host_test.cpp ${MAT_RECEIVER_TEST_SOURCES})
-    target_link_libraries(mat_live_host_tests PRIVATE OpenSSL::Crypto bcrypt advapi32 shell32 ole32 uuid)
+    target_link_libraries(mat_live_host_tests PRIVATE Boost::asio OpenSSL::Crypto bcrypt advapi32 shell32 ole32 uuid ws2_32 mswsock)
     set_target_properties(mat_live_host_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
     add_test(NAME mat_live_host_tests COMMAND mat_live_host_tests)
     set_tests_properties(mat_live_host_tests PROPERTIES TIMEOUT 15)

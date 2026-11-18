@@ -11,14 +11,18 @@ namespace spatial_audio {
     std::string error_;
     std::vector<uint8_t> partial_;
     uint64_t first_qpc_ = 0, last_cycle_qpc_ = 0;
+    uint32_t first_phase_ = 0, last_phase_ = 0;
     std::unique_ptr<spatial_stream::OutputSlot> copy_ = std::make_unique<spatial_stream::OutputSlot>();
 
   public:
-    StreamRingSource(spatial_stream::Output &ring, uint64_t epoch, uint64_t domain): ring_(ring), epoch_(epoch), domain_(domain) { partial_.reserve(carrier_bytes); }
+    StreamRingSource(spatial_stream::Output &ring, uint64_t epoch, uint64_t domain):
+        ring_(ring), epoch_(epoch), domain_(domain) { partial_.reserve(carrier_bytes); }
     Descriptor
     descriptor() const override { return {}; }
     uint64_t
     capture_qpc() const { return last_cycle_qpc_; }
+    uint32_t
+    phase() const { return last_phase_; }
     bool
     start() override {
       if (state_ != State::idle) return false;
@@ -48,11 +52,19 @@ namespace spatial_audio {
           auto &h = copy_->header;
           require(h.sampleStart == expected_ * 480 && h.bytes == process_bytes, "MAT Process block/clock dimensions");
           ++expected_;
-          if (partial_.empty()) first_qpc_ = h.completedQpc;
+          if (partial_.empty()) {
+            // Drain has no captured PCM. Continue the source timeline instead
+            // of switching to the independent Process completion timestamp.
+            first_qpc_ = h.phase == 3 && last_cycle_qpc_ ? last_cycle_qpc_ + receiver::hz() / 50 :
+                         h.captureQpc                    ? h.captureQpc :
+                                                           h.completedQpc;
+            first_phase_ = h.phase;
+          }
           partial_.insert(partial_.end(), copy_->payload, copy_->payload + h.bytes);
           if (partial_.size() < carrier_bytes) continue;
           validate_carrier(partial_);
           last_cycle_qpc_ = first_qpc_;
+          last_phase_ = first_phase_;
           Frame f;
           f.epoch = epoch_;
           f.domain = domain_;

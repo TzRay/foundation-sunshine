@@ -54,11 +54,11 @@ namespace q4 {
     push(const Header &h, const float *pcm, Quantum &output) {
       check(!poisoned_ && !closed_, "v4 assembler closed or poisoned");
       const auto &a = h.audio;
-      check(h.version == version && a.magic == magic && !h.reserved && h.domain && h.renderer && h.encoder && h.implementation && a.tid, "v4 identity/version");
+      check(h.version == version && a.magic == magic && h.domain && h.renderer && h.encoder && h.implementation && a.tid, "v4 identity/version");
       check(a.sequence == sequence_ && a.qpc >= 0, "v4 global sequence/QPC gap");
       ++sequence_;
       check(h.lossEpoch == 0, "v4 capture loss; reject instead of silently recovering");
-      if (h.kind != ObjectBefore) check(!a.frames && !h.properties && !a.host && !a.objectId && !a.type && a.x == 0 && a.y == 0 && a.z == 0 && a.volume == 0 && a.callGain == 0, "v4 control event contains PCM/object metadata");
+      if (h.kind != ObjectBefore) check(!a.frames && !h.properties && !h.contentType && !a.host && !a.objectId && !a.type && a.x == 0 && a.y == 0 && a.z == 0 && a.volume == 0 && a.callGain == 0, "v4 control event contains PCM/object metadata");
       if (h.kind != PassBegin && h.kind != ProcessResult) check(!h.inputFrames, "v4 unexpected input frame field");
       if (h.kind != ProcessResult) check(!h.producedBytes && !h.capacity, "v4 unexpected encoded output fields");
       if (h.kind != DomainBegin && h.kind != DomainEnd) check(!h.reason, "v4 unexpected lifecycle reason");
@@ -102,7 +102,19 @@ namespace q4 {
       }
       check(d.inPass && h.pass == d.pass && a.tid == d.thread, "v4 event outside pass or cross-thread");
       if (h.kind == ObjectBefore) {
-        check(!d.processed && d.pending.size() < objectCapacity && h.call == d.pending.size() + 1 && (d.pending.empty() || d.pending.back().resultSeen) && h.result == E_PENDING && (h.flags == PreCall || h.flags == (PreCall | NullPcm)) && a.frames > 0 && a.frames <= d.frames && pcm && a.type && !(a.type & (a.type - 1)) && !(h.properties & ~15u) && std::isfinite(a.callGain), "v4 unpaired/reentrant/object bounds");
+        check(!d.processed, "v4 object submitted after Process");
+        check(d.pending.size() < objectCapacity, "v4 object capacity exceeded");
+        check(h.call == d.pending.size() + 1 && (d.pending.empty() || d.pending.back().resultSeen), "v4 unpaired/reentrant Submit");
+        check(h.result == E_PENDING && (h.flags == PreCall || h.flags == (PreCall | NullPcm)), "v4 object snapshot flags/result");
+        check(a.frames > 0 && a.frames <= d.frames && pcm, "v4 object frame bounds");
+        check(a.type && !(a.type & (a.type - 1)), "v4 object type is not one channel");
+        // 0x10 marks the HRTF/VAC extension at Properties+0x20 (pinned
+        // audioeng/audioses). DolbyMatEnc::SetAudioObject consumes only the
+        // base lifecycle/position/volume fields, not that extension or bit.
+        // Preserve the observed flags; the MAT bridge reconstructs those base
+        // fields. 0x20 suppresses audio and must not be silently discarded.
+        check(!(h.properties & ~31u), "v4 unsupported object property flags");
+        check(std::isfinite(a.callGain), "v4 nonfinite object gain");
         check(std::all_of(pcm, pcm + a.frames, [](float value) { return std::isfinite(value); }), "v4 nonfinite PCM");
         if (h.flags & NullPcm) check(std::all_of(pcm, pcm + a.frames, [](float value) { return value == 0; }), "v4 null PCM tag not silent");
         Object object;

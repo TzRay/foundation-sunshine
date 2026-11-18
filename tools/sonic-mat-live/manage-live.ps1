@@ -1,6 +1,7 @@
 param(
  [ValidateSet('Preflight','Start','Status','Stop')][string]$Action='Preflight',
  [string]$Build,[string]$Output,[string]$Metadata,
+ [ValidateSet('objects','bed')][string]$Source='objects',[string]$Endpoint='default',
  [uint32]$EnginePid,[uint64]$EngineCreated,
  [switch]$Continuous,[ValidateRange(0,60)][int]$Seconds=0,[switch]$Reattach,
  [ValidatePattern('^[0-9a-f]{32}$')][string]$SessionId
@@ -22,12 +23,14 @@ function Get-State($State){
  $engineAlive=$engine -and $engine.StartTime.ToFileTimeUtc().ToString() -eq $State.engineCreated
  $log=Read-Log $State.captureLog
  $restored=$log -match 'HOOK_STOP restored=1 .*entries=6'
- $failed=$log -match '(?m)^FAILED |(?m)^STOP .*failed=1|(?m)^HOOK_STOP restored=0'
+ $bed=$State.source -eq 'bed'
+ $stopped=$restored -or ($bed -and $log -match '(?m)^BED_STOP verified=1 ')
+ $failed=$log -match '(?m)^FAILED |(?m)^BED_FAILED |(?m)^STOP .*failed=1|(?m)^HOOK_STOP restored=0'
  $nativeSeen=$log -match 'NATIVE_MAT_READY'
  $unsupported=@($log -split "`r?`n"|Where-Object {$_ -match '^COMPONENT .*support=(missing|unsupported)'})
- $status=if($unsupported){'Unsupported'}elseif($failed -or !$engineAlive){'Faulted'}elseif(!$process){if($restored){'StoppedVerified'}else{'ExitedUnverified'}}elseif($nativeSeen){'NativeReady'}else{'WaitingForObjects'}
+ $status=if($unsupported){'Unsupported'}elseif($failed -or !$engineAlive){'Faulted'}elseif(!$process){if($stopped){'StoppedVerified'}else{'ExitedUnverified'}}elseif($nativeSeen){'NativeReady'}elseif($bed){'WaitingForPCM'}else{'WaitingForObjects'}
  [ordered]@{state=$status;publisherAlive=[bool]$process;engineIdentityRetained=[bool]$engineAlive;nativeCyclesObserved=[bool]$nativeSeen;
-  hooksRestored=[bool]$restored;unsupportedComponents=$unsupported;hardwarePlaybackVerified=$false;producer=$State.producer;pipe=$State.pipe;captureLog=$State.captureLog}
+  hooksRestored=[bool]$restored;source=$(if($bed){'bed'}else{'objects'});unsupportedComponents=$unsupported;hardwarePlaybackVerified=$false;producer=$State.producer;pipe=$State.pipe;captureLog=$State.captureLog}
 }
 if($Action -in @('Status','Stop')){
  if(!$Metadata){throw 'Exact capture metadata is required'}
@@ -57,7 +60,8 @@ Assert-MatBuildArtifacts $buildRoot $manifest
 $trusted=@{}
 foreach($name in @('sunshine-plugin-mat-capture.exe','sunshine-plugin-object-tap.dll','sunshine-sonic-mat-worker.dll')){$trusted[$name]=Get-MatTrustedHash $manifest $name}
 function Invoke-Preflight([string]$Image){
- $result=& $Image --preflight $EnginePid $EngineCreated 2>&1
+ $preflightArgs=if($Source -eq 'bed'){@('--source','bed','--preflight',"$EnginePid","$EngineCreated",$Endpoint)}else{@('--preflight',"$EnginePid","$EngineCreated")}
+ $result=& $Image @preflightArgs 2>&1
  if($LASTEXITCODE -eq 3){
   $components=(@($result)|Where-Object {"$_" -like 'COMPONENT *'}) -join "`n"
   throw "This Windows audio engine or Dolby Access build has not been verified for MAT capture; no attach/elevation attempted. Include these lines when reporting it:`n$components"
@@ -90,18 +94,19 @@ Get-ChildItem -LiteralPath $deployment -Force|ForEach-Object {Assert-MatDeployme
 # Run the elevated preflight only from the verified, protected copy.
 Invoke-Preflight $producer|Set-Content -LiteralPath (Join-Path $out preflight.log)
 $id=if($SessionId){$SessionId}else{[guid]::NewGuid().ToString('N')};$pipe='\\.\pipe\SunshineMatLive-active';$stop="Local\SunshineMatLiveStop-$id"
-foreach($value in @($producer,$tap,$codec,$out)){if($value.Contains('"') -or $value.Contains("`r") -or $value.Contains("`n")){throw 'Invalid launch path'}}
+foreach($value in @($producer,$tap,$codec,$out,$Endpoint)){if($value.Contains('"') -or $value.Contains("`r") -or $value.Contains("`n")){throw 'Invalid launch path or endpoint'}}
 $mode=if($Reattach){'--reattach'}else{'--attach'}
 $arguments=@($mode,"$EnginePid","$EngineCreated",('"'+$tap+'"'),$trusted['sunshine-plugin-object-tap.dll'],('"'+$codec+'"'),$trusted['sunshine-sonic-mat-worker.dll'],$pipe,$stop)
+if($Source -eq 'bed'){$arguments=@('--source','bed',$mode,"$EnginePid","$EngineCreated",('"'+$codec+'"'),$trusted['sunshine-sonic-mat-worker.dll'],('"'+$Endpoint+'"'),$pipe,$stop)}
 if($Continuous){$arguments+='--continuous'}else{$arguments+=@('--max-seconds',"$Seconds")}
 $process=$null;$complete=$false
 try{
  $process=Start-Process -FilePath $producer -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput "$out/capture.log" -RedirectStandardError "$out/capture-errors.log"
  $state=@{schema='native-plugin-live-v1';publisherPid=$process.Id;publisherCreated=$process.StartTime.ToFileTimeUtc().ToString();producer=$producer;producerSha256=$exeHash;
-  enginePid=$EnginePid;engineCreated=$EngineCreated.ToString();pipe=$pipe;stopEvent=$stop;captureLog="$out/capture.log";continuous=[bool]$Continuous;maximumSeconds=$Seconds;sampleReplayUsed=$false}
+  enginePid=$EnginePid;engineCreated=$EngineCreated.ToString();pipe=$pipe;stopEvent=$stop;captureLog="$out/capture.log";continuous=[bool]$Continuous;maximumSeconds=$Seconds;sampleReplayUsed=$false;source=$Source;endpoint=$Endpoint}
  $state|ConvertTo-Json|Set-Content -LiteralPath "$out/capture.json"
  $deadline=[DateTime]::UtcNow.AddSeconds(3)
- while((Read-Log "$out/capture.log") -notmatch 'ATTACHED source=plugin-objects-to-native-MAT'){
+ while((Read-Log "$out/capture.log") -notmatch 'ATTACHED source=(plugin-objects-to-native-MAT|bed-pcm-to-native-MAT)'){
   if($process.WaitForExit(20) -or [DateTime]::UtcNow -ge $deadline){throw 'Plugin attach failed/timed out; inspect capture log; no retry'}
  }
  Get-State $state|ConvertTo-Json

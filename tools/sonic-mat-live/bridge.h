@@ -17,7 +17,7 @@ namespace sonic_live {
   // channels, <=20 total. No inferred positions, mixing, offsets or resampling.
   class Bridge {
     struct Active {
-      uint32_t outputId, type;
+      uint32_t outputId, type, contentType;
       bool ended;
     };
     using Key = std::pair<uint64_t, uint32_t>;
@@ -56,6 +56,7 @@ namespace sonic_live {
             auto &c = packet->calls[count++];
             c.id = at->second.outputId;
             c.type = at->second.type;
+            c.contentType = at->second.contentType;
             c.flags = 8;
             c.frames = 480;
             at = active_.erase(at);
@@ -82,13 +83,15 @@ namespace sonic_live {
                 (void) other;
                 check(a.type != raw.type, "Multiple sources for one static channel; mixing unsupported");
               }
-            at = active_.emplace(key, Active { nextId_++, raw.type, false }).first;
+            at = active_.emplace(key, Active { nextId_++, raw.type, raw.contentType, false }).first;
           }
           check(at->second.type == raw.type, "Object type changed inside an identity");
           check(count < receiver::callCapacity, "Object call capacity");
           auto &c = packet->calls[count++];
           c.id = at->second.outputId;
           c.type = raw.type;
+          c.contentType = raw.contentType;
+          at->second.contentType = raw.contentType;
           c.flags = created ? receiver::createFlags(raw.type) : receiver::updateFlags(raw.type);
           c.frames = 480;
           memcpy(c.xyz, raw.xyz, sizeof(c.xyz));
@@ -116,6 +119,7 @@ namespace sonic_live {
             auto &c = packet->calls[count++];
             c.id = at->second.outputId;
             c.type = at->second.type;
+            c.contentType = at->second.contentType;
             c.flags = 8;
             c.frames = 480;
             active_.erase(at);
@@ -147,6 +151,7 @@ namespace sonic_live {
         auto &c = packet->calls[packet->header.calls++];
         c.id = a.outputId;
         c.type = a.type;
+        c.contentType = a.contentType;
         c.flags = 8;
         c.frames = 480;
       }

@@ -53,6 +53,7 @@ namespace sonic_live {
         out.host = object.state.generation;
         out.id = raw.objectId;
         out.type = raw.type;
+        out.contentType = object.source.contentType;
         out.frames = 480;
         if (raw.type == 1) {
           out.xyz[0] = raw.x;

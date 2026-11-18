@@ -23,6 +23,7 @@ main() {
       o.host = 99 + i;
       o.id = 42 + i;
       o.type = 1;
+      o.contentType = i ? 2 : 4;
       o.frames = 480;
       o.result = S_OK;
       o.volume = i ? .8f : .3f;
@@ -35,6 +36,7 @@ main() {
     auto emit = [&](const receiver::Slot &s) {packets.push_back(std::make_unique<receiver::Slot>(s));return true; };
     bridge.push(*p, emit);
     Check(packets.size() == 1 && packets[0]->header.calls == 2 && packets[0]->calls[0].flags == 7);
+    Check(packets[0]->calls[0].contentType == 4 && packets[0]->calls[1].contentType == 2);
     Check(packets[0]->calls[0].pcm[0] == .2f * (.3f * .5f) && packets[0]->calls[1].pcm[0] == .1f * (.8f * .25f));
     p->sequence = 1;
     ++p->firstQpc;
@@ -50,6 +52,7 @@ main() {
     p->objects[0].ended = 1;
     bridge.push(*p, emit);
     Check(packets[2]->header.calls == 2 && packets[2]->calls[0].flags == 8 && packets[2]->calls[1].flags == 6);
+    Check(packets[2]->calls[0].contentType == 4 && packets[2]->calls[1].contentType == 2);
     p->sequence = 3;
     ++p->firstQpc;
     ++p->lastQpc;
@@ -69,7 +72,7 @@ main() {
       p->endCount = 2;
       p->ends[0] = { 99, 42, 0 };
       p->ends[1] = { 100, 43, 0 };
-      delayed.push(*p, [&](auto &packet) {Check(packet.header.calls==2&&packet.calls[0].flags==8&&packet.calls[1].flags==8);++calls;return true; });
+      delayed.push(*p, [&](auto &packet) {Check(packet.header.calls==2&&packet.calls[0].flags==8&&packet.calls[1].flags==8&&packet.calls[0].contentType==4&&packet.calls[1].contentType==2);++calls;return true; });
       delayed.finish([&](auto &packet) {Check(packet.header.kind==2&&packet.header.calls==0);++calls;return true; });
       Check(calls == 2);
     }

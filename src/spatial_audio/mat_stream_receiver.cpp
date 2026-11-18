@@ -211,6 +211,9 @@ fakeSubmit(void *target, const void *stream, const void *properties, const float
   if (s.config.failSubmitAt >= 0 && s.out->submissions == static_cast<uint32_t>(s.config.failSubmitAt)) return E_ABORT;
   if (!s.expected || stream != s.stream || count != 480 || gain != 1.f || s.pending >= 64) return E_FAIL;
   auto &c = *s.expected;
+  BYTE correctStream[24] {};
+  memcpy(correctStream + 12, &c.contentType, sizeof(c.contentType));
+  if (memcmp(stream, correctStream, sizeof(correctStream))) return E_FAIL;
   Properties correct {};
   correct.id = c.id;
   correct.frames = c.frames;
@@ -252,6 +255,9 @@ submit(Session &s, const Call &c) {
   p.y = c.xyz[1];
   p.z = c.xyz[2];
   p.volume = 1;
+  // Only +12 is consumed by the pinned SetAudioObject implementation. The tap
+  // owns this value; do not replace it with a guessed "enable Atmos" constant.
+  memcpy(s.stream + 12, &c.contentType, sizeof(c.contentType));
   s.expected = &c;
   s.out->submitHr = s.submit(s.target, s.stream, &p, c.pcm, 480, 1.f);
   s.expected = nullptr;
@@ -271,10 +277,13 @@ waitUntil(Session &s, HANDLE timer, int64_t target) {
   }
 }
 static bool
-process(Session &s, HANDLE timer, int64_t &next, bool &started, uint32_t phase, uint32_t source) {
+process(Session &s, HANDLE timer, int64_t &next, bool &started, uint32_t phase, uint32_t source, int64_t captureQpc = 0) {
   auto &o = *s.out;
   if (o.processes >= UINT32_MAX - 100) return false;
-  if (!s.fake || s.config.paceMs) {
+  // WASAPI already supplies 480 frames on the device clock. A second 10ms
+  // host timer accumulates clock drift and preserves the warm-up backlog.
+  // Warm-up/drain and the object path retain their bounded timer pacing.
+  if ((!s.fake || s.config.paceMs) && !(s.args.sourceDriven && phase == 2)) {
     auto now = qpc();
     if (!started || now - next > hz() / 500) {
       next = now;
@@ -291,6 +300,7 @@ process(Session &s, HANDLE timer, int64_t &next, bool &started, uint32_t phase, 
   b.phase = phase;
   b.sampleStart = o.processes * 480;
   b.completedQpc = end;
+  b.captureQpc = captureQpc;
   b.sourceIndex = source;
   b.frames = 480;
   const BYTE *data = s.scratch;
@@ -305,6 +315,7 @@ process(Session &s, HANDLE timer, int64_t &next, bool &started, uint32_t phase, 
       auto &c = s.recorded[n];
       add(&c.id, 4);
       add(&c.flags, 4);
+      add(&c.contentType, 4);
       add(c.xyz, 12);
       add(c.pcm, sizeof(c.pcm));
     }
@@ -450,7 +461,7 @@ codecWorker(void *opaque) {
         okay = true;
         break;
       }
-      if (nextSource >= UINT32_MAX - 100 || (s.args.maxSourceRounds && nextSource >= s.args.maxSourceRounds) || !process(s, timer, next, started, 2, nextSource++)) break;
+      if (nextSource >= UINT32_MAX - 100 || (s.args.maxSourceRounds && nextSource >= s.args.maxSourceRounds) || !process(s, timer, next, started, 2, nextSource++, m.firstQpc)) break;
     }
   stop:;
   }

@@ -5,7 +5,7 @@ namespace sonic_live {
   // Owned object passes shared by the plugin adapter and native worker bridge.
   struct Object {
     uint64_t host;
-    uint32_t id, type, offset, frames;
+    uint32_t id, type, offset, frames, contentType;
     float xyz[3], volume, gain;
     int32_t result;
     uint32_t ended, nullPcm;

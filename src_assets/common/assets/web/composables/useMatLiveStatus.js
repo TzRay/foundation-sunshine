@@ -1,6 +1,29 @@
 import { ref } from 'vue'
 import { apiJson } from '../utils/apiFetch.js'
 
+export function matLiveFailureStage(status) {
+  const stages = {
+    prepare: 'source_prepare',
+    'source-read': 'source_delivery',
+    'encrypt-send': 'send',
+    'send-queue': 'send_queue',
+    pipe_prepare: 'source_prepare',
+    pipe_play: 'source_start',
+    pipe_owner: 'source_process',
+    pipe_header: 'source_delivery',
+    pipe_payload: 'source_delivery',
+    pipe_end_ack: 'source_delivery',
+    pipe_restart: 'audio_recovery',
+    audio_recovery: 'audio_recovery',
+    pacing: 'send_schedule',
+    credit: 'send_queue',
+    send_queue: 'send_queue',
+    send: 'send',
+    sender: 'send',
+  }
+  return stages[status?.first_error_stage] ?? 'unknown'
+}
+
 export function useMatLiveStatus() {
   const status = ref(null)
   const loading = ref(false)

@@ -2,6 +2,10 @@
 #include "plugin_bridge.h"
 #include "capture_options.h"
 #include "components.h"
+int RunBedCapture(int argc, wchar_t **argv);
+int RunBedManager(int argc, wchar_t **argv);
+int RunNativeOutput(int argc, wchar_t **argv);
+int RunAudioSessions(int argc, wchar_t **argv);
 static bool
 OriginalPluginBytes(HANDLE engine) {
   constexpr DWORD rvas[] = { 0xfa3b0, 0x2fd90, 0x45be0, 0x31e00, 0x74b50, 0x733f8 };
@@ -28,6 +32,14 @@ PluginRate(HANDLE engine, uint64_t renderer) {
 }
 int
 wmain(int argc, wchar_t **argv) {
+  if (argc >= 2 && std::wstring_view(argv[1]) == L"--list-audio-sessions")
+    return RunAudioSessions(argc, argv);
+  if (argc >= 2 && (std::wstring_view(argv[1]) == L"--install-bed" || std::wstring_view(argv[1]) == L"--supervise-bed" || std::wstring_view(argv[1]) == L"--stop-manager"))
+    return RunBedManager(argc, argv);
+  if (argc >= 3 && std::wstring_view(argv[1]) == L"--source" && std::wstring_view(argv[2]) == L"bed")
+    return RunBedCapture(argc - 2, argv + 2);
+  if (argc >= 3 && std::wstring_view(argv[1]) == L"--source" && std::wstring_view(argv[2]) == L"native")
+    return RunNativeOutput(argc - 2, argv + 2);
   if (argc == 4 && std::wstring(argv[1]) == L"--preflight") {
     HANDLE process = nullptr;
     int code = 1;
@@ -51,7 +63,8 @@ wmain(int argc, wchar_t **argv) {
     return code;
   }
   if ((argc != 11 && argc != 12) || (std::wstring(argv[1]) != L"--attach" && std::wstring(argv[1]) != L"--reattach")) {
-    puts("plugin-mat-capture --preflight PID CREATED | --attach/--reattach PID CREATED TAP TAP_SHA CODEC CODEC_SHA LIVE_PIPE STOP_EVENT (--continuous | --max-seconds 1..60)");
+    puts("plugin-mat-capture --list-audio-sessions [--capture-endpoint ENDPOINT_ID]\n"
+         "  --preflight PID CREATED | --attach/--reattach PID CREATED TAP TAP_SHA CODEC CODEC_SHA LIVE_PIPE STOP_EVENT (--continuous | --max-seconds 1..60)");
     return 2;
   }
   HANDLE engine {}, map {}, thread {}, stop {}, remoteMap {}, remoteOwner {};
@@ -124,10 +137,15 @@ wmain(int argc, wchar_t **argv) {
                 while(r<w){if(!q4::recordReady(*ring,r))break;const auto& s=ring->slots[r%kSlots];const auto& h=s.header;
                     if(h.kind==q4::DomainBegin){rates[h.domain]=PluginRate(engine,h.renderer);printf("PLUGIN_DOMAIN domain=%llu renderer=0x%llx rate=%u\n",h.domain,h.renderer,rates[h.domain]);}
                     if(h.kind==q4::PassBegin)starts[h.domain]=h.audio.qpc;
-                    q4::Quantum quantum;if(assembler.push(h,s.pcm,quantum)){
+                    q4::Quantum quantum;bool complete=false;
+                    try {complete=assembler.push(h,s.pcm,quantum);}catch(const std::exception& e){
+                        printf("PLUGIN_RECORD_REJECT reason=%s sequence=%llu domain=%llu pass=%llu kind=%u call=%llu frames=%u type=0x%x properties=0x%x flags=0x%x result=0x%08x gain=%g\n",e.what(),h.audio.sequence,h.domain,h.pass,h.kind,h.call,h.audio.frames,h.audio.type,h.properties,h.flags,static_cast<unsigned>(h.result),h.audio.callGain);throw;}
+                    if(complete){
                         if(!selected&&!quantum.objects.empty()){selected=quantum.domain;uint32_t mask=0,dynamic=0;
                             for(const auto& o:quantum.objects){if(o.source.audio.type==1)++dynamic;else mask|=o.source.audio.type;}
-                            printf("PLUGIN_SOURCE domain=%llu renderer=0x%llx objects=%zu frames=%u rate=%u staticMask=0x%x dynamicObjects=%u\n",selected,quantum.renderer,quantum.objects.size(),quantum.frames,rates.at(selected),mask,dynamic);}
+                            printf("PLUGIN_SOURCE domain=%llu renderer=0x%llx objects=%zu frames=%u rate=%u staticMask=0x%x dynamicObjects=%u\n",selected,quantum.renderer,quantum.objects.size(),quantum.frames,rates.at(selected),mask,dynamic);
+                            std::set<uint32_t> contentTypes;for(const auto& o:quantum.objects)contentTypes.insert(o.source.contentType);
+                            for(auto contentType:contentTypes)printf("PLUGIN_SOURCE_CONTENT domain=%llu contentType=%u observed=1\n",selected,contentType);}
                         if(selected&&quantum.domain!=selected)require(quantum.objects.empty(),"Multiple object-bearing plugin domains");
                         else if(selected)bridge.push(quantum,starts.at(h.domain),h.audio.qpc,rates.at(h.domain),[&](const receiver::Slot& packet){if(!native)native=std::make_unique<NativeSession>(engine,codec,codecBase,vendor,bridge.renderer(),epoch,shared,"plugin-reencode");return native->send(packet);});
                     }
@@ -146,7 +164,7 @@ wmain(int argc, wchar_t **argv) {
                     printf("PLUGIN_STOP passes=%llu inputSamples=%llu outputOnlyPasses=%llu restored=1\n",bridge.passes(),bridge.samples(),bridge.outputOnlyPasses());break;}
                 Sleep(1);
             }
-        }catch(const std::exception& e){Broken(shared,e.what());InterlockedExchange(&ring->stop,1);} });
+        }catch(const std::exception& e){printf("PLUGIN_CONTROLLER_FAILURE %s\n",e.what());Broken(shared,e.what());InterlockedExchange(&ring->stop,1);} });
     mat_capture::Descriptor descriptor;
     descriptor.kind = mat_capture::native_object_source;
     descriptor.publisher_pid = GetCurrentProcessId();
@@ -173,6 +191,8 @@ wmain(int argc, wchar_t **argv) {
   bool done = !thread || WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0;
   if (engine && ring) {
     bool restored = done && OriginalPluginBytes(engine);
+    printf("PLUGIN_DIAGNOSTIC firstFault=%ld args=%ld,%ld,%ld invalid=%lld droppedFull=%lld droppedBusy=%lld unbound=%lld extended=%lld renderCalls=%lld calls=%lld domains=%lld\n",
+      ring->firstFault, ring->faultArg1, ring->faultArg2, ring->faultArg3, Read64(&ring->invalid), Read64(&ring->droppedFull), Read64(&ring->droppedBusy), Read64(&ring->unboundAfterArming), Read64(&ring->extendedCalls), Read64(&ring->renderCalls), Read64(&ring->calls), Read64(&ring->domainsOpened));
     printf("HOOK_STOP restored=%d nativeStatus=%ld nativeError=%ld entries=6\n", restored, ring->status, ring->error);
     if (!restored) result = 1;
   }
